@@ -1,0 +1,43 @@
+name: Nightly data update
+
+on:
+  schedule:
+    # GitHub schedules are UTC. 09:15 and 10:15 UTC cover 4:15 AM
+    # America/Chicago in both daylight time and standard time.
+    - cron: "15 9 * * *"
+    - cron: "15 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Chicago hour
+        id: clock
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$(TZ=America/Chicago date +%H)" = "04" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "America/Chicago is $(TZ=America/Chicago date +%H):00, not 04:00. Skipping."
+          fi
+      - name: Update the last two days
+        if: steps.clock.outputs.run == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -m bayesratings.nightly

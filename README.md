@@ -65,7 +65,9 @@ Column names and types for each file are in the manifest. This page does not rep
 
 ## Update schedule
 
-Every day at 7:15 AM America/Chicago. The current season of each league is refreshed each night. Older seasons are rewritten when a file is missing or the export version changes. A changed file is published again at the same URL.
+Every day at about 4:00 AM America/Chicago, from GitHub Actions in this repo. The job loads the current-season Parquet files and refreshes the last two days of games, team box scores, team game stats, and player game logs. A changed file is published again at the same URL. Older seasons are left in place.
+
+Rosters, injuries, transactions, depth charts, probables, lineups, and weather are not refreshed by this job. Those releases stay as published.
 
 ## License and attribution
 
