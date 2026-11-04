@@ -65,9 +65,9 @@ Column names and types for each file are in the manifest. This page does not rep
 
 ## Update schedule
 
-Every day at about 4:00 AM America/Chicago, from GitHub Actions in this repo. The job loads the current-season Parquet files and refreshes the last two days of games, team box scores, team game stats, and player game logs. A changed file is published again at the same URL. Older seasons are left in place.
+Every day at about 4:00 AM America/Chicago, from GitHub Actions in this repo. The job loads the current-season Parquet files and refreshes the last two days of games, team box scores, team game stats, and player game logs. It also refreshes current ESPN rosters, new ESPN injury details, ESPN transactions, NFL depth charts, and ESPN probables and weather. A changed file is published again at the same URL. Older seasons are left in place.
 
-Rosters, injuries, transactions, depth charts, probables, lineups, and weather are not refreshed by this job. Those releases stay as published.
+NBA official injury reports, NFL practice reports, MLB Stats API transactions, Daily Faceoff, NBA.com lineups, and National Weather Service forecasts are not re-fetched. Rows already published from those sources stay in the files.
 
 ## License and attribution
 

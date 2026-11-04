@@ -3,8 +3,10 @@ two days from ESPN, export, and upload only the files that changed.
 
     python -m bayesratings.nightly --dry-run
 
-History snapshots are not rebuilt here. Rosters, injuries, transactions,
-depth charts, probables, lineups, and weather stay as already published.
+Rosters, depth charts, ESPN transactions, and new ESPN injury details are
+refreshed from the copied prelog passes. Scoreboard probables and ESPN
+weather move with the game ingest. See snapshots.NOT_REFRESHED for the
+sources that are kept but not re-fetched.
 """
 
 import argparse
@@ -23,7 +25,7 @@ from pathlib import Path
 import pandas as pd
 import pyarrow.parquet as pq
 
-from . import backfill, db, export, gh_publish, labstats, players, teambox
+from . import backfill, db, export, gh_publish, labstats, players, snapshots, teambox
 from .export import BOX, COUNT_NAMES, SEASON_TYPES
 
 OWNER_REPO = "WalrusQuant/sportsleader-data"
@@ -35,10 +37,7 @@ UPDATE = (
     "batting_game_logs", "pitching_game_logs",
     "passing_game_logs", "rushing_game_logs", "receiving_game_logs",
 )
-UNTOUCHED = (
-    "rosters", "injuries", "transactions", "depth_charts",
-    "probables", "lineups", "weather",
-)
+SNAPSHOTS = snapshots.DATASETS
 LOG_TABLE = {
     "player_game_logs": "player_game_nba",
     "skater_game_logs": "player_game_nhl_skater",
@@ -147,9 +146,10 @@ def current_files(manifest):
     latest = {}
     for entry in manifest["files"]:
         latest[entry["league"]] = max(latest.get(entry["league"], 0), int(entry["season"]))
+    keep = set(UPDATE) | set(SNAPSHOTS)
     wanted = []
     for entry in manifest["files"]:
-        if entry["dataset"] in UPDATE and int(entry["season"]) == latest[entry["league"]]:
+        if entry["dataset"] in keep and int(entry["season"]) == latest[entry["league"]]:
             wanted.append(entry)
     return latest, wanted
 
@@ -339,6 +339,8 @@ def load_file(conn, teams, entry, path):
         return load_box(conn, teams, league, frame)
     if dataset == "team_game_stats":
         return load_stats(conn, teams, league, frame)
+    if dataset in SNAPSHOTS:
+        return snapshots.load(conn, teams, league, dataset, frame)
     return load_log(conn, teams, league, dataset, frame)
 
 
@@ -370,23 +372,27 @@ def canon(v):
 def row_diff(old_path, new_path):
     old = pd.read_parquet(old_path)
     new = pd.read_parquet(new_path)
-    keys = [c for c in ("game_id", "team_id", "player_id", "source") if c in old.columns]
     if list(old.columns) != list(new.columns):
         return {"rows_added": None, "rows_updated": None, "rows_removed": None,
                 "column_mismatch": True, "old_rows": len(old), "new_rows": len(new)}
+    cols = list(old.columns)
 
-    def keyed(frame):
-        out = {}
+    def bags(frame):
+        counts = {}
         for rec in frame.to_dict("records"):
-            key = tuple(canon(rec[c]) for c in keys)
-            out[key] = tuple(canon(rec[c]) for c in frame.columns)
-        return out
+            row = tuple(canon(rec[c]) for c in cols)
+            counts[row] = counts.get(row, 0) + 1
+        return counts
 
-    a, b = keyed(old), keyed(new)
-    added = len(set(b) - set(a))
-    removed = len(set(a) - set(b))
-    updated = sum(1 for k in set(a) & set(b) if a[k] != b[k])
-    return {"rows_added": added, "rows_updated": updated, "rows_removed": removed,
+    a, b = bags(old), bags(new)
+    added = removed = 0
+    for row in set(a) | set(b):
+        delta = b.get(row, 0) - a.get(row, 0)
+        if delta > 0:
+            added += delta
+        elif delta < 0:
+            removed += -delta
+    return {"rows_added": added, "rows_updated": 0, "rows_removed": removed,
             "column_mismatch": False, "old_rows": len(old), "new_rows": len(new)}
 
 
@@ -458,6 +464,8 @@ def run(dry_run=False, cache=None):
     for entry in ordered:
         n = load_file(conn, teams, entry, local[entry["path"]])
         loaded[entry["path"]] = n
+    snapshots.seed_lookups(conn)
+    seen = snapshots.remember(conn)
     log(f"loaded {sum(loaded.values())} rows in {time.perf_counter() - t0:.1f}s")
 
     today = datetime.now(export.CENTRAL).date()
@@ -470,13 +478,16 @@ def run(dry_run=False, cache=None):
     player_stats = players.extract(conn, list(LEAGUES), log=log)
     box_stats = teambox.extract(conn, list(LEAGUES), log=log)
     lab_stats = labstats.extract(conn, list(LEAGUES), log=log)
+    snap = snapshots.refresh(conn, log=log)
+    snapshots.restore(conn, seen)
     conn.close()
-    log(f"extract done at {time.perf_counter() - t0:.1f}s")
+    log(f"extract+snapshots done at {time.perf_counter() - t0:.1f}s ({snap.get('requests')} snapshot requests)")
 
     for child in out.glob("*"):
         if child.is_file():
             child.unlink()
-    exported = export.run(str(db_path), out, leagues=LEAGUES, datasets=set(UPDATE), log=log)
+    exported = export.run(str(db_path), out, leagues=LEAGUES,
+                          datasets=set(UPDATE) | set(SNAPSHOTS), log=log)
     by_path = {entry["path"]: entry for entry in manifest["files"]}
     report = []
     changed = []
@@ -506,7 +517,7 @@ def run(dry_run=False, cache=None):
     man_bytes = (json.dumps(merged, indent=1) + "\n").encode()
     total = time.perf_counter() - t0
     log(f"TOTAL {total:.1f}s; {len(changed)} files would upload; dry_run={dry_run}")
-    log(f"not updated by this job: {', '.join(UNTOUCHED)}")
+    log("not re-fetched: " + "; ".join(snapshots.NOT_REFRESHED))
     if dry_run or not changed:
         return {"seconds": round(total, 1), "changed": [c[0] for c in changed],
                 "report": report, "backfill": stats,

@@ -36,7 +36,7 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "America/Chicago is $(TZ=America/Chicago date +%H):00, not 04:00. Skipping."
           fi
-      - name: Update the last two days
+      - name: Update games and current snapshots
         if: steps.clock.outputs.run == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
