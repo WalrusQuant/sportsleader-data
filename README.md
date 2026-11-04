@@ -1,4 +1,4 @@
-# bayesRatings data
+# sportsleader-data
 
 Parquet files of game, player, team, and roster data for MLB, NBA, NFL, and NHL. One file per league, data set, and season. Rebuilt every night.
 
@@ -7,7 +7,7 @@ Downloads are GitHub Release assets. A file keeps the same URL when a new copy i
 ## URLs
 
 ```
-https://github.com/WalrusQuant/bayesratings-data/releases/download/<tag>/<file>.parquet
+https://github.com/WalrusQuant/sportsleader-data/releases/download/<tag>/<file>.parquet
 ```
 
 - Tag: `<league>_<dataset>` (for example `nba_games`, `mlb_batting_game_logs`)
@@ -15,11 +15,11 @@ https://github.com/WalrusQuant/bayesratings-data/releases/download/<tag>/<file>.
 
 Sample:
 
-https://github.com/WalrusQuant/bayesratings-data/releases/download/nba_games/2027.parquet
+https://github.com/WalrusQuant/sportsleader-data/releases/download/nba_games/2027.parquet
 
 The file list is `manifest.json` on the `manifest` release. Each entry has `url`, `rows`, `columns`, `bytes`, `sha256`, `league`, `dataset`, and `season`.
 
-https://github.com/WalrusQuant/bayesratings-data/releases/download/manifest/manifest.json
+https://github.com/WalrusQuant/sportsleader-data/releases/download/manifest/manifest.json
 
 A client can read the manifest and download a file only when its `sha256` has changed.
 
@@ -71,6 +71,6 @@ Every day at 7:15 AM America/Chicago. The current season of each league is refre
 
 Game, box score, roster, injury, transaction, lineup, depth-chart, and weather rows are collected from public sources, chiefly ESPN. Some data sets also include rows from the MLB Stats API, the NBA official injury report, nflverse, Daily Faceoff, or the National Weather Service, as named in the data set above.
 
-bayesRatings is not affiliated with ESPN, those sources, or the leagues. These files are a convenience copy of that data. No other license is granted here; the underlying data remains under the terms of its source. Attribute game data to ESPN (and to the other source named on the data set) and these files to bayesRatings: https://github.com/WalrusQuant/bayesratings-data
+sportsleader-data is not affiliated with ESPN, those sources, or the leagues. These files are a convenience copy of that data. No other license is granted here; the underlying data remains under the terms of its source. Attribute game data to ESPN (and to the other source named on the data set) and these files to sportsleader-data: https://github.com/WalrusQuant/sportsleader-data
 
 These files do not include ratings, forecasts or betting lines.
