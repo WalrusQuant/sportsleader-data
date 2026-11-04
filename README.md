@@ -1,6 +1,6 @@
 # bayesRatings data
 
-Parquet files of game, player, team, and roster data for MLB, NBA, NFL, and NHL, plus the published team ratings. One file per league, data set, and season. Rebuilt every night.
+Parquet files of game, player, team, and roster data for MLB, NBA, NFL, and NHL. One file per league, data set, and season. Rebuilt every night.
 
 Downloads are GitHub Release assets. A file keeps the same URL when a new copy is published.
 
@@ -62,7 +62,6 @@ Column names and types for each file are in the manifest. This page does not rep
 | `probables` | mlb, nhl | Probable starting pitchers and goalies (ESPN, Daily Faceoff). |
 | `lineups` | mlb, nba, nhl | Announced lineups: MLB batting orders, NBA starting fives, NHL lines, ESPN pre-game. |
 | `weather` | mlb, nfl | Game weather: ESPN conditions and National Weather Service hourly outlook for the venue. |
-| `team_ratings` | mlb, nba, nfl, nhl | Published team ratings: the rating and its range as shown on the site, by day. |
 
 ## Update schedule
 
@@ -74,4 +73,4 @@ Game, box score, roster, injury, transaction, lineup, depth-chart, and weather r
 
 bayesRatings is not affiliated with ESPN, those sources, or the leagues. These files are a convenience copy of that data. No other license is granted here; the underlying data remains under the terms of its source. Attribute game data to ESPN (and to the other source named on the data set) and these files to bayesRatings: https://github.com/WalrusQuant/bayesratings-data
 
-`team_ratings` is the published bayesRatings rating and its range, by team and day. These files do not include forecasts or betting lines.
+These files do not include ratings, forecasts or betting lines.
