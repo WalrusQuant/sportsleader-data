@@ -2,8 +2,11 @@ name: Nightly data update
 
 on:
   schedule:
-    # GitHub schedules are UTC. 09:15 and 10:15 UTC cover 4:15 AM
-    # America/Chicago in both daylight time and standard time.
+    # GitHub schedules are UTC. 09:15 and 10:15 UTC are 4:15 AM
+    # America/Chicago in daylight time and standard time. During
+    # standard time, 09:15 UTC is 3:15 AM CT, and the job below waits
+    # until 04:00. A schedule that GitHub starts late still updates
+    # once, unless this Chicago date is already published.
     - cron: "15 9 * * *"
     - cron: "15 10 * * *"
   workflow_dispatch:
@@ -23,21 +26,126 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install
-        run: pip install -r requirements.txt
-      - name: Chicago hour
-        id: clock
+      - name: Decide whether to update
+        id: decide
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          elif [ "$(TZ=America/Chicago date +%H)" = "04" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "America/Chicago is $(TZ=America/Chicago date +%H):00, not 04:00. Skipping."
-          fi
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          CHICAGO = ZoneInfo("America/Chicago")
+          MANIFEST_URL = (
+              "https://github.com/WalrusQuant/sportsleader-data/releases/download/"
+              "manifest/manifest.json"
+          )
+
+
+          def decide(event_name, now, generated_at):
+              """Return (should_run, message).
+
+              workflow_dispatch always updates. A schedule updates only at or
+              after 04:00 America/Chicago, and only when the published manifest
+              was not already generated on today's Chicago date.
+              """
+              local = now.astimezone(CHICAGO)
+              clock = f"{local:%Y-%m-%d %H:%M}"
+              if event_name == "workflow_dispatch":
+                  return True, (
+                      "RUN: workflow_dispatch always updates. "
+                      f"America/Chicago is {clock}."
+                  )
+              if local.hour < 4:
+                  return False, (
+                      "SKIP: America/Chicago is "
+                      f"{clock}, before 04:00. "
+                      "Scheduled updates wait until 4:00 AM CT."
+                  )
+              if not generated_at or not str(generated_at).strip():
+                  raise RuntimeError("manifest has no generated_at")
+              stamp = datetime.fromisoformat(str(generated_at).strip())
+              if stamp.tzinfo is None:
+                  stamp = stamp.replace(tzinfo=ZoneInfo("UTC"))
+              published = stamp.astimezone(CHICAGO)
+              if published.date() == local.date():
+                  return False, (
+                      "SKIP: already updated on "
+                      f"{local:%Y-%m-%d} America/Chicago "
+                      f"(now {local:%H:%M}). "
+                      f"Manifest generated_at={generated_at} "
+                      f"({published:%Y-%m-%d %H:%M %Z})."
+                  )
+              return True, (
+                  "RUN: no publish yet for "
+                  f"{local:%Y-%m-%d} America/Chicago "
+                  f"(now {local:%H:%M}, at or after 04:00). "
+                  f"Manifest generated_at={generated_at} "
+                  f"is {published:%Y-%m-%d %H:%M %Z}."
+              )
+
+
+          def fetch_generated_at():
+              req = urllib.request.Request(
+                  MANIFEST_URL,
+                  headers={"User-Agent": "sportsleader-data-nightly"},
+              )
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  manifest = json.load(resp)
+              generated = manifest.get("generated_at")
+              if not isinstance(generated, str) or not generated.strip():
+                  raise RuntimeError("manifest has no generated_at")
+              return generated
+
+
+          def emit(should_run, message):
+              print(message, flush=True)
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                  fh.write(f"run={'true' if should_run else 'false'}\n")
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  heading = (
+                      "Nightly update will run" if should_run else "Nightly update skipped"
+                  )
+                  with open(summary, "a", encoding="utf-8") as fh:
+                      fh.write(f"### {heading}\n\n{message}\n")
+
+
+          def main():
+              event = os.environ.get("GITHUB_EVENT_NAME", "")
+              now = datetime.now(CHICAGO)
+              generated_at = None
+              if event != "workflow_dispatch" and now.hour >= 4:
+                  try:
+                      generated_at = fetch_generated_at()
+                  except Exception as exc:
+                      print(
+                          "FAIL: could not read manifest generated_at: "
+                          f"{type(exc).__name__}: {exc}",
+                          flush=True,
+                      )
+                      raise
+              try:
+                  should_run, message = decide(event, now, generated_at)
+              except Exception as exc:
+                  print(
+                      "FAIL: could not decide whether to update: "
+                      f"{type(exc).__name__}: {exc}",
+                      flush=True,
+                  )
+                  raise
+              emit(should_run, message)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+      - name: Install
+        if: steps.decide.outputs.run == 'true'
+        run: pip install -r requirements.txt
       - name: Update games and current snapshots
-        if: steps.clock.outputs.run == 'true'
+        if: steps.decide.outputs.run == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python -m bayesratings.nightly
