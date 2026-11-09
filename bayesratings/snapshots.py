@@ -6,10 +6,12 @@ Scoreboard probables and ESPN weather are updated by backfill, which already
 calls prelog.log_scoreboard. History already in the release files is loaded
 first so a run cannot drop it.
 
-These sources are not re-fetched: NBA official injury PDFs, NFL practice
-reports (nflverse), MLB Stats API transactions, Daily Faceoff, and the
-National Weather Service. Their existing rows are loaded and written back
-unchanged.
+NBA.com lineups and Daily Faceoff goalies and lines are refreshed for the
+recent window by lineup_refresh. A failure there is logged and does not
+stop this pass. These sources are not re-fetched: NBA official injury
+PDFs, NFL practice reports (nflverse), MLB Stats API transactions, and
+the National Weather Service. Their existing rows are loaded and written
+back unchanged.
 """
 
 import hashlib
@@ -29,8 +31,6 @@ NOT_REFRESHED = (
     "injuries from the NBA official report",
     "injuries from the NFL practice report",
     "transactions from the MLB Stats API",
-    "probables and lineups from Daily Faceoff",
-    "lineups from NBA.com",
     "weather from the National Weather Service",
 )
 DETAIL_CAP = 25
@@ -550,5 +550,12 @@ def refresh(conn, log=print):
         out[f"tx_{league}"] = prelog.transactions_pass(conn, league, pace, log=log)
     out["depth"] = prelog.depth_pass(conn, pace, log=log)
     out["tx_dupes_removed"] = _dedupe_transactions(conn)
-    out["requests"] = pace.n
+    try:
+        from . import lineup_refresh
+        extra = lineup_refresh.refresh(conn, log=log)
+    except Exception as e:
+        log(f"lineup refresh ERROR {type(e).__name__}: {e}")
+        extra = {"errors": 1, "requests": 0}
+    out["lineups"] = extra
+    out["requests"] = pace.n + int(extra.get("requests") or 0)
     return out
