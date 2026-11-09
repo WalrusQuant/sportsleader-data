@@ -5,7 +5,9 @@ two days from ESPN, export, and upload only the files that changed.
 
 Rosters, depth charts, ESPN transactions, and new ESPN injury details are
 refreshed from the copied prelog passes. Scoreboard probables and ESPN
-weather move with the game ingest. See snapshots.NOT_REFRESHED for the
+weather move with the game ingest. NBA.com lineups and Daily Faceoff
+goalies and lines are refreshed for the recent window; a failure there is
+logged and does not stop the publish. See snapshots.NOT_REFRESHED for the
 sources that are kept but not re-fetched.
 """
 
