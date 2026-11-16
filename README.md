@@ -59,19 +59,19 @@ Column names and types for each file are in the manifest. This page does not rep
 | `injuries` | mlb, nba, nfl, nhl | Injury entries: ESPN (all leagues), NBA official report, NFL practice report. |
 | `transactions` | mlb, nba, nfl, nhl | Transactions: ESPN (all leagues) and MLB official. |
 | `depth_charts` | nfl | NFL depth chart slots with the time span each was current. |
-| `probables` | mlb, nhl | Probable starting pitchers and goalies (ESPN, Daily Faceoff). |
-| `lineups` | mlb, nba, nhl | Announced lineups: MLB batting orders, NBA starting fives, NHL lines, ESPN pre-game. |
+| `probables` | mlb, nhl | Probable starting pitchers and goalies. ESPN lists the pre-game goalie (`source` `espn`, status Expected or Confirmed). After an NHL game, the official starter is added (`source` `nhl_api`, status Confirmed). |
+| `lineups` | mlb, nba, nhl | Announced lineups: MLB batting orders, NBA starting fives, NHL even-strength lines and defense pairs, ESPN pre-game. NHL rows with `source` `nhl_api` are post-game: `role` is `line_ev`, `slot` is `f1`… for a forward line and `d1`… for a defense pair, and `game_id` / `game_date` are filled. A unit is the players who shared that ice for at least two minutes at 5-on-5. Older rows may still have `source` `daily_faceoff` and an empty `game_id`. No columns were added. |
 | `weather` | mlb, nfl | Game weather: ESPN conditions and National Weather Service hourly outlook for the venue. |
 
 ## Update schedule
 
-Every day at about 4:00 AM America/Chicago, from GitHub Actions in this repo. The job loads the current-season Parquet files and refreshes the last two days of games, team box scores, team game stats, and player game logs. It also refreshes current ESPN rosters, new ESPN injury details, ESPN transactions, NFL depth charts, and ESPN probables and weather. NBA.com starting lineups, and Daily Faceoff goalies and line combinations, are refreshed for the last eight days through the next day. A changed file is published again at the same URL. Older seasons are left in place.
+Every day at about 4:00 AM America/Chicago, from GitHub Actions in this repo. The job loads the current-season Parquet files and refreshes the last two days of games, team box scores, team game stats, and player game logs. It also refreshes current ESPN rosters, new ESPN injury details, ESPN transactions, NFL depth charts, and ESPN probables and weather. NBA.com starting lineups are refreshed for the last eight days through the next day. NHL starters, forward lines, and defense pairs are read from the official NHL API for completed games in that same window that are not already in the file. A changed file is published again at the same URL. Older seasons are left in place.
 
 NBA official injury reports, NFL practice reports, MLB Stats API transactions, and National Weather Service forecasts are not re-fetched. Rows already published from those sources stay in the files. If a lineup page is missing or the source blocks the fetch, that page is logged and skipped. The rest of the nightly publish still runs.
 
 ## License and attribution
 
-Game, box score, roster, injury, transaction, lineup, depth-chart, and weather rows are collected from public sources, chiefly ESPN. Some data sets also include rows from the MLB Stats API, the NBA official injury report, nflverse, Daily Faceoff, or the National Weather Service, as named in the data set above.
+Game, box score, roster, injury, transaction, lineup, depth-chart, and weather rows are collected from public sources, chiefly ESPN. Some data sets also include rows from the MLB Stats API, the NBA official injury report, nflverse, the official NHL API, or the National Weather Service, as named in the data set above. Older lineup and probable files may still contain Daily Faceoff rows from before that switch.
 
 sportsleader-data is not affiliated with ESPN, those sources, or the leagues. These files are a convenience copy of that data. No other license is granted here; the underlying data remains under the terms of its source. Attribute game data to ESPN (and to the other source named on the data set) and these files to sportsleader-data: https://github.com/WalrusQuant/sportsleader-data
 

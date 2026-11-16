@@ -6,9 +6,10 @@ Scoreboard probables and ESPN weather are updated by backfill, which already
 calls prelog.log_scoreboard. History already in the release files is loaded
 first so a run cannot drop it.
 
-NBA.com lineups and Daily Faceoff goalies and lines are refreshed for the
-recent window by lineup_refresh. A failure there is logged and does not
-stop this pass. These sources are not re-fetched: NBA official injury
+NBA.com lineups are refreshed for the recent window by lineup_refresh.
+Official NHL starters, forward lines, and defense pairs are refreshed there
+too, for completed games that are not already stored. A failure is logged
+and does not stop this pass. These sources are not re-fetched: NBA official injury
 PDFs, NFL practice reports (nflverse), MLB Stats API transactions, and
 the National Weather Service. Their existing rows are loaded and written
 back unchanged.
@@ -339,8 +340,9 @@ def _probables(conn, teams, league, frame):
         tid = None if empty(rec.get("team_id")) else teams.id(
             league, rec["team_id"], rec.get("team_abbr"), rec.get("team_name"))
         aid = as_int(rec.get("player_id"))
-        if rec.get("source") == "daily_faceoff":
+        if rec.get("source") in ("daily_faceoff", "nhl_api"):
             dfo.append((
+                text(rec.get("source")) or "daily_faceoff",
                 league, iso(rec.get("game_date")) or "", int(rec["team_id"]),
                 tid, as_int(rec.get("game_id")), text(rec.get("player_name")), aid,
                 text(rec.get("status")), text(rec.get("note")),
@@ -367,11 +369,12 @@ def _probables(conn, teams, league, frame):
              for r, vf, vt, ls in espn])
     if dfo:
         conn.executemany(
-            "INSERT INTO nhl_goalie_states (league, game_date, dfo_team_id, team_id, "
+            "INSERT INTO nhl_goalie_states (source, league, game_date, dfo_team_id, team_id, "
             "espn_event_id, goalie_name, athlete_id, strength, news_details, raw_json, "
             "state_hash, valid_from, valid_to, last_seen) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            [(a, b, c, d, e, f, g, h, i, "{}", j, k, l, m) for a, b, c, d, e, f, g, h, i, j, k, l, m in dfo])
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(a, b, c, d, e, f, g, h, i, j, "{}", k, l, m, n)
+             for a, b, c, d, e, f, g, h, i, j, k, l, m, n in dfo])
     conn.commit()
     return len(espn) + len(dfo)
 
@@ -404,13 +407,15 @@ def _lineups(conn, teams, league, frame):
                                                       "status": text(rec.get("status"))}),
                 vf, vt, ls,
             ))
-        elif src == "daily_faceoff":
+        elif src in ("daily_faceoff", "nhl_api"):
             role = text(rec.get("role")) or ""
             category = role[5:] if role.startswith("line_") else role
+            gdate = iso(rec.get("game_date"))
             nhl.append((
-                league, int(rec["team_id"]) if not empty(rec.get("team_id")) else 0,
+                src, league, int(rec["team_id"]) if not empty(rec.get("team_id")) else 0,
                 tid, text(rec.get("slot")) or "", category, aid or 0, aid,
                 text(rec.get("player_name")), text(rec.get("position")), text(rec.get("status")),
+                as_int(rec.get("game_id")), None if gdate is None else gdate[:10],
                 state_hash(("athlete_id",), {"athlete_id": aid}), vf, vt, ls,
             ))
         elif src == "espn_pregame":
@@ -433,10 +438,12 @@ def _lineups(conn, teams, league, frame):
             [(a, b, c, d, e, f, g, h, "{}", i, j, k, l) for a, b, c, d, e, f, g, h, i, j, k, l in nba])
     if nhl:
         conn.executemany(
-            "INSERT INTO nhl_line_states (league, dfo_team_id, team_id, group_id, category, "
-            "dfo_player_id, athlete_id, name, position_id, injury_status, raw_json, state_hash, "
-            "valid_from, valid_to, last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            [(a, b, c, d, e, f, g, h, i, j, "{}", k, l, m, n) for a, b, c, d, e, f, g, h, i, j, k, l, m, n in nhl])
+            "INSERT INTO nhl_line_states (source, league, dfo_team_id, team_id, group_id, category, "
+            "dfo_player_id, athlete_id, name, position_id, injury_status, espn_event_id, game_date, "
+            "raw_json, state_hash, valid_from, valid_to, last_seen) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(a, b, c, d, e, f, g, h, i, j, k, l, m, "{}", n, o, p, q)
+             for a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q in nhl])
     if pre:
         conn.executemany(
             "INSERT OR IGNORE INTO pregame_lineups (espn_event_id, fetched_at, team_id, role, "
