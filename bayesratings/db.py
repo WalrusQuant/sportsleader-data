@@ -74,6 +74,10 @@ _ADDED_COLUMNS = {
     | {"line_venues": "TEXT"},
     # raw MLB Stats API "espn" xref, kept even when it isn't an ESPN athlete id
     "ext_ids": {"xref_id": "INTEGER"},
+    # official NHL starter / post-game lines (lineup_refresh). Older rows stay NULL.
+    "nhl_goalie_states": {"source": "TEXT", "nhl_player_id": "INTEGER"},
+    "nhl_line_states": {"source": "TEXT", "espn_event_id": "INTEGER", "game_date": "TEXT",
+                        "nhl_player_id": "INTEGER", "nhl_game_id": "INTEGER"},
 }
 
 

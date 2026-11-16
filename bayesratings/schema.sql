@@ -955,7 +955,9 @@ CREATE TABLE IF NOT EXISTS mlb_lineup_states (
 CREATE INDEX IF NOT EXISTS idx_mlb_lineup_game ON mlb_lineup_states (game_pk, valid_to);
 CREATE INDEX IF NOT EXISTS idx_mlb_lineup_event ON mlb_lineup_states (espn_event_id);
 
--- Daily Faceoff starting goalies: one state per (date, team)
+-- Starting goalies. source daily_faceoff is a historical row.
+-- source nhl_api is the official boxscore starter, one row per team per game.
+-- Pre-game goalies stay in game_probables (ESPN, kind SG).
 CREATE TABLE IF NOT EXISTS nhl_goalie_states (
     id              INTEGER PRIMARY KEY,
     league          TEXT    NOT NULL DEFAULT 'nhl',
@@ -974,6 +976,8 @@ CREATE TABLE IF NOT EXISTS nhl_goalie_states (
     news_details    TEXT,
     source_name     TEXT,
     source_url      TEXT,
+    source          TEXT,                       -- daily_faceoff | nhl_api
+    nhl_player_id   INTEGER,                    -- official id; athlete_id is the ESPN id
     raw_json        TEXT,
     state_hash      TEXT    NOT NULL,
     valid_from      TEXT    NOT NULL,
@@ -983,7 +987,8 @@ CREATE TABLE IF NOT EXISTS nhl_goalie_states (
 CREATE INDEX IF NOT EXISTS idx_nhl_goalie_date ON nhl_goalie_states (game_date, valid_to);
 CREATE INDEX IF NOT EXISTS idx_nhl_goalie_event ON nhl_goalie_states (espn_event_id);
 
--- Daily Faceoff line combinations: one state per (team, unit, player)
+-- Line combinations. source daily_faceoff is a historical team chart with no game.
+-- source nhl_api is one post-game 5v5 forward line or defense pair for one game.
 CREATE TABLE IF NOT EXISTS nhl_line_states (
     id             INTEGER PRIMARY KEY,
     league         TEXT    NOT NULL DEFAULT 'nhl',
@@ -999,6 +1004,11 @@ CREATE TABLE IF NOT EXISTS nhl_line_states (
     gtd            INTEGER,
     dfo_updated_at TEXT,
     dfo_source     TEXT,
+    source         TEXT,                        -- daily_faceoff | nhl_api
+    espn_event_id  INTEGER,
+    game_date      TEXT,
+    nhl_player_id  INTEGER,                     -- official id; dfo_player_id holds it too for nhl_api
+    nhl_game_id    INTEGER,
     raw_json       TEXT,
     state_hash     TEXT    NOT NULL,
     valid_from     TEXT    NOT NULL,
@@ -1006,6 +1016,7 @@ CREATE TABLE IF NOT EXISTS nhl_line_states (
     last_seen      TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_nhl_line_team ON nhl_line_states (dfo_team_id, valid_to);
+CREATE INDEX IF NOT EXISTS idx_nhl_line_event ON nhl_line_states (espn_event_id, valid_to);
 
 -- NBA official injury report PDFs (one row per report fetched)
 CREATE TABLE IF NOT EXISTS nba_injury_reports (

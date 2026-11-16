@@ -449,7 +449,7 @@ PROB_SQL = (
     "FROM game_probables gp LEFT JOIN games g ON g.espn_event_id = gp.espn_event_id "
     "LEFT JOIN teams t ON t.team_id = gp.team_id WHERE gp.league = :league "
     "UNION ALL "
-    "SELECT 'daily_faceoff', s.league, s.game_date, s.espn_event_id, s.game_date, "
+    "SELECT COALESCE(s.source, 'daily_faceoff'), s.league, s.game_date, s.espn_event_id, s.game_date, "
     + _team("t", "team") + ", 'starting_goalie', s.athlete_id, s.goalie_name, s.strength, "
     "s.news_details, s.valid_from, s.valid_to, s.last_seen "
     "FROM nhl_goalie_states s LEFT JOIN teams t ON t.team_id = s.team_id "
@@ -476,7 +476,9 @@ LINEUP_SQL = (
     "FROM nba_lineup_states n LEFT JOIN games g ON g.espn_event_id = n.espn_event_id "
     "LEFT JOIN teams t ON t.team_id = n.team_id WHERE n.league = :league "
     "UNION ALL "
-    "SELECT 'daily_faceoff', l.league, l.valid_from, NULL, NULL, " + _team("t", "team") + ", "
+    "SELECT COALESCE(l.source, 'daily_faceoff'), l.league, "
+    "COALESCE(l.game_date, l.valid_from), l.espn_event_id, l.game_date, "
+    + _team("t", "team") + ", "
     "'line_' || l.category, l.group_id, l.athlete_id, l.name, l.position_id, "
     "l.injury_status, l.valid_from, l.valid_to, l.last_seen "
     "FROM nhl_line_states l LEFT JOIN teams t ON t.team_id = l.team_id "
@@ -555,9 +557,11 @@ DATASETS = [
     Dataset("depth_charts", ("nfl",), "state", DEPTH_SQL, DEPTH_COLS,
             doc="NFL depth chart slots with the time span each was current."),
     Dataset("probables", ("mlb", "nhl"), "state", PROB_SQL, PROB_COLS,
-            doc="Probable starting pitchers and goalies (ESPN, Daily Faceoff)."),
+            doc="Probable starting pitchers and goalies. ESPN lists the pre-game goalie. "
+                "Played NHL games add the official starter (source nhl_api)."),
     Dataset("lineups", ("mlb", "nba", "nhl"), "state", LINEUP_SQL, LINEUP_COLS,
-            doc="Announced lineups: MLB batting orders, NBA starting fives, NHL lines, ESPN pre-game."),
+            doc="Announced lineups: MLB batting orders, NBA starting fives, "
+                "NHL even-strength lines and defense pairs (source nhl_api), ESPN pre-game."),
     Dataset("weather", ("mlb", "nfl"), "state", WX_SQL, WX_COLS,
             doc="Game weather: ESPN conditions and National Weather Service hourly outlook for the venue."),
 ]
