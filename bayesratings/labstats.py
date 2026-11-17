@@ -11,7 +11,7 @@ import time
 from . import db
 
 VERSION = 4
-LEAGUES = ("mlb", "nba", "nfl", "nhl")
+LEAGUES = ("mlb", "nba", "nfl", "nhl", "cfb", "cbb")
 _CUP_NAME = re.compile(r"nba\s*cup|in[-\s]?season\s+tournament", re.I)
 _CUP_CHAMP = re.compile(r"championship", re.I)
 COUNTS = {
@@ -31,6 +31,10 @@ COUNTS = {
             "qs", "sv", "bs", "bp_outs", "bp_er",
             "po", "a", "e", "dp"),
 }
+# Same counting stats as the pro league the box is copied from. Shared tuples
+# so a college file cannot grow a column the pro file does not have.
+COUNTS["cfb"] = COUNTS["nfl"]
+COUNTS["cbb"] = COUNTS["nba"]
 _CLOCK = {"END OF HALF", "END OF GAME", "END OF REGULATION"}
 
 
@@ -239,6 +243,17 @@ def _nba_minutes(summary):
     periods = max((len(c.get("linescores") or []) for c in comp), default=0)
     if periods >= 4:
         return 48 + 5 * (periods - 4)
+    return None
+
+
+def _cbb_minutes(summary):
+    """Men's college games are two 20-minute halves, then 5-minute overtimes.
+    linescores length is the period count. The NBA clock is left alone."""
+    comp = (((summary.get("header") or {}).get("competitions") or [{}])[0]
+            .get("competitors") or [])
+    periods = max((len(c.get("linescores") or []) for c in comp), default=0)
+    if periods >= 2:
+        return 40 + 5 * (periods - 2)
     return None
 
 
@@ -463,12 +478,23 @@ def parse(summary, league, espn_ids):
             raw[eid] = None
             continue
         try:
+            flat = _team_flat(team)
             if league == "nfl":
-                d = _nfl(_team_flat(team), summary, eid, players)
+                d = _nfl(flat, summary, eid, players)
+            elif league == "cfb":
+                # Same reader as the NFL. The college box has no QB hits
+                # (it has hurries), so that one count stays blank instead of 0.
+                d = _nfl(flat, summary, eid, players)
+                if d is not None:
+                    d["def_qbh"] = None
             elif league == "nba":
-                d = _nba(_team_flat(team), summary)
+                d = _nba(flat, summary)
+            elif league == "cbb":
+                d = _nba(flat, summary)
+                if d is not None:
+                    d["minutes"] = _cbb_minutes(summary)
             elif league == "nhl":
-                d = _nhl(_team_flat(team), players, eid)
+                d = _nhl(flat, players, eid)
             elif league == "mlb":
                 d = _mlb(team, players, eid)
             else:
@@ -476,7 +502,7 @@ def parse(summary, league, espn_ids):
         except (TypeError, ValueError, KeyError, IndexError, AttributeError):
             d = None
         raw[eid] = d
-    if league == "nba":
+    if league in ("nba", "cbb"):
         have = [eid for eid in ids if raw.get(eid)]
         poss = _bbref_poss(raw[have[0]], raw[have[1]]) if len(have) == 2 else None
         for eid in have:

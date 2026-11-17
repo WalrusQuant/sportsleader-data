@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from . import db
 from .views.fmt import BOX_STATS
 
-LEAGUES = ("mlb", "nba", "nfl", "nhl")
+LEAGUES = ("mlb", "nba", "nfl", "nhl", "cfb", "cbb")
 
 
 def version(league):

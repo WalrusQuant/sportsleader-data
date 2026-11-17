@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from . import db
 
 PARSER_VERSION = 1
-LEAGUES = ("mlb", "nba", "nfl", "nhl")
+LEAGUES = ("mlb", "nba", "nfl", "nhl", "cfb", "cbb")
 
 TABLES = {
     "mlb": ("player_game_mlb_batting", "player_game_mlb_pitching"),
@@ -32,6 +32,9 @@ TABLES = {
     "nhl": ("player_game_nhl_skater", "player_game_nhl_goalie"),
     "nfl": ("player_game_nfl_passing", "player_game_nfl_rushing",
             "player_game_nfl_receiving", "player_game_nfl_other"),
+    "cfb": ("player_game_cfb_passing", "player_game_cfb_rushing",
+            "player_game_cfb_receiving", "player_game_cfb_other"),
+    "cbb": ("player_game_cbb",),
 }
 COMMON = ("espn_event_id", "season", "season_type", "game_date", "team_id",
           "opp_team_id", "is_home", "athlete_id")
@@ -266,7 +269,25 @@ def _nfl(team, base):
     return out
 
 
-PARSERS = {"mlb": _mlb, "nba": _nba, "nhl": _nhl, "nfl": _nfl}
+def _rename_tables(parsed, src, dst):
+    """Point a pro parser's table names at the college tables. The rows
+    themselves are unchanged, so the exported columns stay aligned."""
+    return {k.replace(src, dst, 1): v for k, v in parsed.items()}
+
+
+def _cfb(team, base):
+    """College football uses the NFL box layout. Passing has QBR and does not
+    send sacks, sack yards, or passer rating. Receiving does not send targets.
+    Missing keys stay None."""
+    return _rename_tables(_nfl(team, base), "player_game_nfl_", "player_game_cfb_")
+
+
+def _cbb(team, base):
+    """Men's college basketball uses the NBA box layout without plus/minus."""
+    return _rename_tables(_nba(team, base), "player_game_nba", "player_game_cbb")
+
+
+PARSERS = {"mlb": _mlb, "nba": _nba, "nhl": _nhl, "nfl": _nfl, "cfb": _cfb, "cbb": _cbb}
 
 
 def parse_game(summary, game, espn_to_team):

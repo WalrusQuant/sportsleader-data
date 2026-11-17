@@ -492,6 +492,65 @@ CREATE TABLE IF NOT EXISTS player_game_nfl_receiving (
     PRIMARY KEY (espn_event_id, team_id, athlete_id)
 );
 
+-- College football passing/rushing/receiving. Same columns as the NFL tables.
+-- ESPN's college passing box has QBR and does not send sacks, sack yards, or
+-- passer rating; the receiving box does not send targets. Those columns stay
+-- NULL. Other categories (defense, kicking, returns) are stored and not exported.
+CREATE TABLE IF NOT EXISTS player_game_cfb_passing (
+    espn_event_id INTEGER NOT NULL, season INTEGER NOT NULL, season_type INTEGER,
+    game_date TEXT NOT NULL, team_id INTEGER NOT NULL, opp_team_id INTEGER NOT NULL,
+    is_home INTEGER NOT NULL, athlete_id INTEGER NOT NULL,
+    qb_starter INTEGER NOT NULL,
+    cmp INTEGER, att INTEGER, yds INTEGER, td INTEGER, ints INTEGER,
+    sacks INTEGER, sack_yds INTEGER, qbr REAL, rating REAL,
+    stats_json TEXT NOT NULL,
+    PRIMARY KEY (espn_event_id, team_id, athlete_id)
+);
+
+CREATE TABLE IF NOT EXISTS player_game_cfb_rushing (
+    espn_event_id INTEGER NOT NULL, season INTEGER NOT NULL, season_type INTEGER,
+    game_date TEXT NOT NULL, team_id INTEGER NOT NULL, opp_team_id INTEGER NOT NULL,
+    is_home INTEGER NOT NULL, athlete_id INTEGER NOT NULL,
+    car INTEGER, yds INTEGER, td INTEGER, long INTEGER,
+    stats_json TEXT NOT NULL,
+    PRIMARY KEY (espn_event_id, team_id, athlete_id)
+);
+
+CREATE TABLE IF NOT EXISTS player_game_cfb_receiving (
+    espn_event_id INTEGER NOT NULL, season INTEGER NOT NULL, season_type INTEGER,
+    game_date TEXT NOT NULL, team_id INTEGER NOT NULL, opp_team_id INTEGER NOT NULL,
+    is_home INTEGER NOT NULL, athlete_id INTEGER NOT NULL,
+    rec INTEGER, tgt INTEGER, yds INTEGER, td INTEGER, long INTEGER,
+    stats_json TEXT NOT NULL,
+    PRIMARY KEY (espn_event_id, team_id, athlete_id)
+);
+
+CREATE TABLE IF NOT EXISTS player_game_cfb_other (
+    espn_event_id INTEGER NOT NULL, season INTEGER NOT NULL, season_type INTEGER,
+    game_date TEXT NOT NULL, team_id INTEGER NOT NULL, opp_team_id INTEGER NOT NULL,
+    is_home INTEGER NOT NULL, athlete_id INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    stats_json TEXT NOT NULL,
+    PRIMARY KEY (espn_event_id, team_id, athlete_id, category)
+);
+
+-- Men's college basketball. Same columns as the NBA table. ESPN does not send
+-- plus/minus, so that column stays NULL. Did-not-play rows are kept.
+CREATE TABLE IF NOT EXISTS player_game_cbb (
+    espn_event_id INTEGER NOT NULL, season INTEGER NOT NULL, season_type INTEGER,
+    game_date TEXT NOT NULL, team_id INTEGER NOT NULL, opp_team_id INTEGER NOT NULL,
+    is_home INTEGER NOT NULL, athlete_id INTEGER NOT NULL, position TEXT,
+    starter INTEGER NOT NULL,
+    did_not_play INTEGER NOT NULL,
+    dnp_reason TEXT,
+    ejected INTEGER,
+    minutes INTEGER, pts INTEGER, fgm INTEGER, fga INTEGER, fg3m INTEGER, fg3a INTEGER,
+    ftm INTEGER, fta INTEGER, reb INTEGER, oreb INTEGER, dreb INTEGER, ast INTEGER,
+    tov INTEGER, stl INTEGER, blk INTEGER, pf INTEGER, plus_minus INTEGER,
+    stats_json TEXT NOT NULL,
+    PRIMARY KEY (espn_event_id, team_id, athlete_id)
+);
+
 -- NFL defense, fumbles, interceptions, kick/punt returns, kicking, punting:
 -- one row per player and category; stats in stats_json (json_extract them).
 CREATE TABLE IF NOT EXISTS player_game_nfl_other (

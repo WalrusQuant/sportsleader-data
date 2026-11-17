@@ -1,14 +1,20 @@
-"""Four-league ESPN backfill: scoreboards day by day, plus the raw game summary
-for every completed game.
+"""ESPN backfill: scoreboards day by day, plus the raw game summary for every
+completed game that is new or whose score changed.
 
     python -m bayesratings.backfill --leagues mlb,nba,nfl,nhl --seasons 5 \
         --db data/bayesratings.db
 
 Resumable: each (league, date) is recorded in backfill_dates and each summary in
 game_summaries, so a rerun skips finished work. Dates within the last two days
-are always refetched (results may still be filling in). Requests are paced at
---rate seconds apart; espn._get backs off exponentially on 429/5xx.
+are always refetched (results may still be filling in). Scoreboard requests are
+paced at --rate seconds apart; espn._get backs off exponentially on 429/5xx.
+Summary requests use a small pool (the nightly job and the one-season backfill
+use 4) and are skipped when the game is already final with the same score.
 Preseason (season.type 1) and All-Star games are not stored.
+
+College football (`cfb`) is FBS, season = start year, from 2021.
+Men's college basketball (`cbb`) is Division I, season = end year, from 2021
+(the 2020-21 season).
 """
 
 import argparse
@@ -16,6 +22,7 @@ import gzip
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 
 from . import db
@@ -24,6 +31,14 @@ from . import prelog
 
 KEEP_SEASON_TYPES = (2, 3)  # regular + postseason
 RECHECK_DAYS = 2
+# How many summary requests may be in flight at once. The nightly job and the
+# one-season backfill use this. The plain CLI stays sequential unless asked.
+SUMMARY_WORKERS = 4
+# First season this repo publishes. cbb 2021 is the 2020-21 season.
+FIRST_SEASON = {
+    "mlb": 2021, "nfl": 2021, "nba": 2022, "nhl": 2022,
+    "cfb": 2021, "cbb": 2021,
+}
 
 
 def season_window(league: str, season: int) -> tuple:
@@ -34,8 +49,12 @@ def season_window(league: str, season: int) -> tuple:
         return date(season, 3, 1), date(season, 11, 30)
     if league == "nfl":                       # start year; Sep->Feb next year
         return date(season, 8, 1), date(season + 1, 2, 28)
+    if league == "cfb":                       # start year; late August through January
+        return date(season, 8, 1), date(season + 1, 2, 20)
     if league in ("nba", "nhl"):              # end year; Oct prev->Jul
         return date(season - 1, 9, 15), date(season, 7, 15)
+    if league == "cbb":                       # end year; early November through early April
+        return date(season - 1, 10, 15), date(season, 4, 30)
     raise ValueError(f"unknown league {league!r}")
 
 
@@ -43,11 +62,27 @@ def current_season(league: str, today: date) -> int:
     """Season label in progress (or most recently started) on `today`."""
     if league == "mlb":
         return today.year if today.month >= 3 else today.year - 1
-    if league == "nfl":
+    if league in ("nfl", "cfb"):
         return today.year if today.month >= 8 else today.year - 1
     if league in ("nba", "nhl"):
         return today.year + 1 if (today.month, today.day) >= (9, 15) else today.year
+    if league == "cbb":
+        # 2026-27 opened on Nov 2. From Oct 15 the coming season is current so
+        # a one-season backfill can include opening week.
+        return today.year + 1 if (today.month, today.day) >= (10, 15) else today.year
     raise ValueError(f"unknown league {league!r}")
+
+
+def season_dates(league: str, season: int, today: date) -> list:
+    """Every date in one season's window, through today."""
+    start, end = season_window(league, season)
+    last = min(end, today)
+    out = []
+    d = start
+    while d <= last:
+        out.append(d)
+        d += timedelta(days=1)
+    return out
 
 
 def seasons_for(league: str, n_completed: int, today: date) -> list:
@@ -97,14 +132,107 @@ def _done_dates(conn, league: str, recheck_from: date) -> set:
     return {r[0] for r in rows}
 
 
-def _missing_summaries(conn, league: str, event_ids) -> list:
+def _prior_state(conn, event_ids) -> dict:
+    """State of these games before this scoreboard is written. A nightly run
+    has team boxes loaded from the published file and no stored summary. A
+    resumed backfill has the summary and no need to fetch it again."""
     if not event_ids:
+        return {}
+    q = ("SELECT g.espn_event_id, g.completed, g.home_score, g.away_score, "
+         "EXISTS(SELECT 1 FROM game_summaries s WHERE s.espn_event_id = g.espn_event_id), "
+         "EXISTS(SELECT 1 FROM team_game_box b WHERE b.espn_event_id = g.espn_event_id "
+         "AND b.stats_json IS NOT NULL) "
+         f"FROM games g WHERE g.espn_event_id IN ({', '.join('?' * len(event_ids))})")
+    out = {}
+    for eid, comp, hs, aws, has_summary, has_box in conn.execute(q, tuple(event_ids)):
+        out[int(eid)] = {
+            "completed": bool(comp),
+            "home_score": hs,
+            "away_score": aws,
+            "has_summary": bool(has_summary),
+            "has_box": bool(has_box),
+        }
+    return out
+
+
+def summaries_to_fetch(games, prior) -> list:
+    """Completed games that need a summary. A game already final, with the
+    same score, is skipped when its summary is stored or its team box was
+    loaded from the published file. A new game, a game that just finished,
+    or a game whose score changed is fetched."""
+    out = []
+    for g in games:
+        if g.get("season_type") not in KEEP_SEASON_TYPES or not g.get("completed"):
+            continue
+        eid = g["espn_event_id"]
+        prev = prior.get(eid)
+        if prev is None:
+            out.append(eid)
+            continue
+        same = (prev.get("home_score") == g.get("home_score")
+                and prev.get("away_score") == g.get("away_score"))
+        if prev.get("completed") and same and (prev.get("has_summary") or prev.get("has_box")):
+            continue
+        out.append(eid)
+    return out
+
+
+class SummaryFetchError(RuntimeError):
+    """Some summaries failed. `stored` is the ones that succeeded, kept so a
+    rerun does not download them again. The message has no URL and no token."""
+
+    def __init__(self, stored, failed):
+        self.stored = stored
+        self.failed = failed
+        eid, exc = failed[0]
+        super().__init__(
+            f"{len(failed)} summary fetches failed "
+            f"(first event {eid}: {type(exc).__name__})")
+
+
+def map_summaries(league, event_ids, fetch, workers):
+    """Fetch summaries with at most `workers` requests in flight. `fetch` is
+    called as fetch(league, event_id) and must not touch the database."""
+    ids = list(event_ids)
+    if not ids:
         return []
-    q = ("SELECT g.espn_event_id FROM games g LEFT JOIN game_summaries s "
-         "USING (espn_event_id) WHERE g.league = ? AND g.completed = 1 "
-         "AND s.espn_event_id IS NULL AND g.espn_event_id IN "
-         f"({', '.join('?' * len(event_ids))})")
-    return [r[0] for r in conn.execute(q, (league, *event_ids))]
+    workers = max(1, min(int(workers or 1), len(ids)))
+
+    def one(eid):
+        return eid, fetch(league, eid)
+
+    if workers == 1:
+        stored = []
+        for eid in ids:
+            try:
+                stored.append(one(eid))
+            except Exception as exc:
+                raise SummaryFetchError(stored, [(eid, exc)]) from exc
+        return stored
+    stored, failed = [], []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(one, eid): eid for eid in ids}
+        for fut in as_completed(futs):
+            eid = futs[fut]
+            try:
+                stored.append(fut.result())
+            except Exception as exc:
+                failed.append((eid, exc))
+    if failed:
+        raise SummaryFetchError(stored, failed)
+    return stored
+
+
+def public_error(exc) -> str:
+    """Error text safe to print: no URL, host, address, or token."""
+    msg = str(exc)
+    low = msg.lower()
+    if ("://" in msg or "http" in low or "bearer " in low or "github_pat_" in low
+            or "ghp_" in low or "gho_" in low or "token=" in low):
+        return type(exc).__name__
+    if msg.count(".") >= 3 and any(ch.isdigit() for ch in msg):
+        return type(exc).__name__
+    return f"{type(exc).__name__}: {msg[:180]}"
 
 
 def store_summary(conn, league: str, event_id: int, data: dict) -> None:
@@ -190,14 +318,23 @@ def plan(conn, leagues, n_seasons, today, only_dates=None) -> dict:
     return out
 
 
+def _store_fetched(conn, league, fetched) -> None:
+    for eid, payload in fetched:
+        store_summary(conn, league, eid, payload)
+    if fetched:
+        conn.commit()
+
+
 def run(conn, leagues, n_seasons, rate=1.0, today=None, only_dates=None,
-        est_games_per_date=None) -> dict:
+        est_games_per_date=None, summary_workers=1, only_season=None) -> dict:
     today = today or date.today()
     pace = Pacer(rate)
     todo = plan(conn, leagues, n_seasons, today, only_dates)
     total_dates = sum(len(v) for v in todo.values())
     # rough per-date game estimate for the ETA until real counts accumulate
-    est = est_games_per_date or {"mlb": 9, "nba": 4.5, "nfl": 1.4, "nhl": 5.5}
+    est = est_games_per_date or {
+        "mlb": 9, "nba": 4.5, "nfl": 1.4, "nhl": 5.5, "cfb": 12, "cbb": 40,
+    }
     log(f"plan: {total_dates} dates to fetch "
         + ", ".join(f"{lg}={len(v)}" for lg, v in todo.items()))
     stats = {"dates": 0, "games": 0, "summaries": 0, "errors": 0, "removed": 0}
@@ -213,22 +350,43 @@ def run(conn, leagues, n_seasons, rate=1.0, today=None, only_dates=None,
         for i, d in enumerate(todo[lg]):
             ds = d.isoformat()
             try:
+                params = espn.scoreboard_params(lg, dates=f"{d:%Y%m%d}")
                 data = pace(espn.fetch_scoreboard, lg, dates=f"{d:%Y%m%d}")
+                n_events = len(data.get("events") or []) if isinstance(data, dict) else 0
+                if n_events >= int(params["limit"]):
+                    log(f"{lg} {ds} scoreboard returned {n_events} events, "
+                        f"at the limit of {params['limit']}")
                 parsed = espn.parse_scoreboard(data, lg)
                 parsed["games"] = [g for g in parsed["games"]
                                    if g["season_type"] in KEEP_SEASON_TYPES]
+                if only_season is not None:
+                    parsed["games"] = [g for g in parsed["games"]
+                                       if g.get("season") == only_season]
+                ids = [g["espn_event_id"] for g in parsed["games"]]
+                # Read the published final before ingest overwrites the score.
+                prior = _prior_state(conn, ids)
                 n = db.ingest_scoreboard(conn, lg, parsed)
                 if d >= today - timedelta(days=1):
                     gone = reconcile_date(conn, lg, d, data, today)
                     stats["removed"] += len(gone)
                     # probables / odds / weather from the same payload (logging only)
                     prelog._add(plog, prelog.log_scoreboard(conn, lg, data, log=log))
-                ids = [g["espn_event_id"] for g in parsed["games"]]
-                for eid in _missing_summaries(conn, lg, ids):
-                    store_summary(conn, lg, eid,
-                                  pace(espn.fetch_summary, lg, eid))
-                    conn.commit()
-                    stats["summaries"] += 1
+                need = summaries_to_fetch(parsed["games"], prior)
+                try:
+                    if summary_workers <= 1:
+                        fetched = map_summaries(
+                            lg, need, lambda l, e: pace(espn.fetch_summary, l, e), 1)
+                    else:
+                        fetched = map_summaries(lg, need, espn.fetch_summary, summary_workers)
+                        pace.n += len(fetched)
+                except SummaryFetchError as err:
+                    _store_fetched(conn, lg, err.stored)
+                    stats["summaries"] += len(err.stored)
+                    if summary_workers > 1:
+                        pace.n += len(err.stored)
+                    raise
+                _store_fetched(conn, lg, fetched)
+                stats["summaries"] += len(fetched)
                 # done only once every completed game has its summary
                 conn.execute(
                     "INSERT OR REPLACE INTO backfill_dates VALUES (?,?,?,?,?)",
@@ -242,13 +400,13 @@ def run(conn, leagues, n_seasons, rate=1.0, today=None, only_dates=None,
                     "INSERT OR REPLACE INTO backfill_dates VALUES (?,?,?,?,?)",
                     (lg, ds, None, "error", _now()))
                 conn.commit()
-                log(f"{lg} {ds} ERROR {type(e).__name__}: {e}")
+                log(f"{lg} {ds} ERROR {public_error(e)}")
             stats["dates"] += 1
             dates_left -= 1
             if (i + 1) % 25 == 0 or i + 1 == len(todo[lg]):
-                rem = sum(len(todo[x]) * (1 + est[x]) for x in
+                rem = sum(len(todo[x]) * (1 + est.get(x, 5)) for x in
                           leagues[leagues.index(lg) + 1:])
-                rem += (len(todo[lg]) - i - 1) * (1 + est[lg])
+                rem += (len(todo[lg]) - i - 1) * (1 + est.get(lg, 5))
                 log(f"{lg} {ds}  {i + 1}/{len(todo[lg])} dates, "
                     f"{lg_games} games, {pace.n} requests, "
                     f"{pace.per_request():.2f}s/req, "
@@ -273,7 +431,9 @@ def main(argv=None):
                     help="completed seasons before the current one")
     ap.add_argument("--db", default="data/bayesratings.db")
     ap.add_argument("--rate", type=float, default=1.0,
-                    help="minimum seconds between requests")
+                    help="minimum seconds between scoreboard requests")
+    ap.add_argument("--summary-workers", type=int, default=1,
+                    help="summary requests in flight (1 keeps them on --rate)")
     ap.add_argument("--dates", default=None,
                     help="comma list of YYYY-MM-DD; overrides the season "
                          "windows (for sampling/testing)")
@@ -286,7 +446,8 @@ def main(argv=None):
             if args.dates else None)
     conn = db.connect(args.db)
     db.init_db(conn)
-    stats = run(conn, leagues, args.seasons, rate=args.rate, only_dates=only)
+    stats = run(conn, leagues, args.seasons, rate=args.rate, only_dates=only,
+                summary_workers=args.summary_workers)
     log(f"finished: {stats}")
 
 

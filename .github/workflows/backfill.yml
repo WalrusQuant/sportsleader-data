@@ -1,0 +1,82 @@
+name: Backfill one season
+
+# Started by hand. One league and one season per run. Not on a schedule,
+# and not in the nightly job's concurrency group: a shared group can cancel
+# a pending nightly run.
+on:
+  workflow_dispatch:
+    inputs:
+      league:
+        description: League
+        required: true
+        type: choice
+        options:
+          - cfb
+          - cbb
+          - mlb
+          - nba
+          - nfl
+          - nhl
+      season:
+        description: Season year (cfb/nfl/mlb start year; cbb/nba/nhl end year)
+        required: true
+        type: string
+      force:
+        description: Rebuild even if this season is already in the manifest
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: season-backfill-${{ inputs.league }}-${{ inputs.season }}
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Clear a forced rebuild
+        if: inputs.force == true
+        run: rm -rf backfill-cache
+      - uses: actions/cache/restore@v4
+        if: inputs.force != true
+        with:
+          path: backfill-cache
+          key: season-backfill-${{ inputs.league }}-${{ inputs.season }}-${{ github.run_id }}
+          restore-keys: |
+            season-backfill-${{ inputs.league }}-${{ inputs.season }}-
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Backfill one season
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BACKFILL_LEAGUE: ${{ inputs.league }}
+          BACKFILL_SEASON: ${{ inputs.season }}
+          BACKFILL_FORCE: ${{ inputs.force }}
+        run: |
+          set -eu
+          mkdir -p backfill-cache
+          extra=()
+          if [ "$BACKFILL_FORCE" = "true" ]; then
+            extra+=(--force)
+          fi
+          python -m bayesratings.season_backfill \
+            --league "$BACKFILL_LEAGUE" \
+            --season "$BACKFILL_SEASON" \
+            --cache backfill-cache \
+            --summary-workers 4 \
+            "${extra[@]}"
+      - uses: actions/cache/save@v4
+        if: always() && inputs.force != true
+        continue-on-error: true
+        with:
+          path: backfill-cache
+          key: season-backfill-${{ inputs.league }}-${{ inputs.season }}-${{ github.run_id }}
