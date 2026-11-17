@@ -8,7 +8,8 @@ first so a run cannot drop it.
 
 NBA.com lineups are refreshed for the recent window by lineup_refresh.
 Official NHL starters, forward lines, and defense pairs are refreshed there
-too, for completed games that are not already stored. A failure is logged
+too, for completed games that do not already have both. An empty shift chart
+is retried until 48 hours after the opening faceoff. A failure is logged
 and does not stop this pass. These sources are not re-fetched: NBA official injury
 PDFs, NFL practice reports (nflverse), MLB Stats API transactions, and
 the National Weather Service. Their existing rows are loaded and written

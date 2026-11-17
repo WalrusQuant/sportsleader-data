@@ -11,13 +11,18 @@ made a full copy of the old passes a poor fit for a short run:
   kind SG). The official NHL API has no projected lines and no pre-game
   starter. Once a game is final, the box score flags the starter and the
   shift chart has every even-strength shift. Lines and defense pairs are the
-  forward trios and defense pairs that shared 5-on-5 time.
+  forward trios and defense pairs that shared 5-on-5 time. Each team keeps
+  the longest four forward lines and three defense pairs that do not share
+  a player.
 
 This pass only covers the last ``LOOKBACK_DAYS`` through tomorrow. NHL
-fetches are limited to completed games in that window that are not already
-stored with source ``nhl_api``, so a nightly run reads the new slate and
-does not walk the season. A page that is missing or unparsable is logged
-and skipped. Nothing here raises: the rest of the nightly publish still runs.
+fetches are limited to completed games in that window that do not already
+have both official starters and a settled set of lines, so a nightly run
+reads the new slate and does not walk the season. A shift chart that is
+empty is tried again on later nights until a fetch at least
+``EMPTY_CHART_HOURS`` after the opening faceoff still has no lines. A page
+that is missing or unparsable is logged and skipped. Nothing here raises:
+the rest of the nightly publish still runs.
 """
 
 import gzip
@@ -39,6 +44,13 @@ LOOKAHEAD_DAYS = 1
 BUDGET_S = 75
 # 5v5 units shorter than this are line-change noise, not a deployed line.
 MIN_UNIT_SECONDS = 120
+# Deployed even-strength groups. Extra trios and pairs are shared-ice noise:
+# one player was landing in as many as five forward groups.
+MAX_FORWARD_LINES = 4
+MAX_DEFENSE_PAIRS = 3
+# A chart that is still empty this long after the opening faceoff is done.
+# Earlier nights try the game again; the rest of the season is not rebuilt.
+EMPTY_CHART_HOURS = 48
 NBA_URL = "https://stats.nba.com/js/data/leaders/00_daily_lineups_{d}.json"
 DEPTH_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{espn_id}/depthcharts"
 NHL_SCHEDULE = "https://api-web.nhle.com/v1/schedule/{day}"
@@ -431,15 +443,32 @@ def _on_ice(active):
     }
 
 
+def _period(value):
+    """1-based period, including every overtime. Missing and 0 are not shifts."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text.isdigit():
+            return None
+        value = int(text)
+    if value < 1:
+        return None
+    return value
+
+
 def build_units(shifts, positions, min_seconds=MIN_UNIT_SECONDS) -> dict:
     """Forward lines and defense pairs from shared 5-on-5 time.
 
     A second counts only when each team has exactly five skaters on the ice
     (goalies are not skaters). A forward line is the three forwards on the
-    ice in that second. A defense pair is the two defensemen. Units under
-    ``min_seconds`` are dropped. ``positions`` maps a player id to kind
-    ``F``, ``D``, or ``G``. Shift-chart first and last names replace the
-    box score's abbreviated name when both are present.
+    ice in that second. A defense pair is the two defensemen. Every period
+    counts, so a playoff overtime past the first extra period is included.
+    Units under ``min_seconds`` are dropped. Each team then keeps the
+    longest ``MAX_FORWARD_LINES`` forward lines and ``MAX_DEFENSE_PAIRS``
+    defense pairs that do not share a player. ``positions`` maps a player
+    id to kind ``F``, ``D``, or ``G``. Shift-chart first and last names
+    replace the box score's abbreviated name when both are present.
     """
     meta = {int(pid): dict(info) for pid, info in (positions or {}).items()}
     intervals = []
@@ -447,8 +476,8 @@ def build_units(shifts, positions, min_seconds=MIN_UNIT_SECONDS) -> dict:
         code = row.get("typeCode")
         if code not in (None, 517):
             continue
-        period = row.get("period")
-        if period not in (1, 2, 3, 4):
+        period = _period(row.get("period"))
+        if period is None:
             continue
         start, end = _clock(row.get("startTime")), _clock(row.get("endTime"))
         if start is None or end is None or end <= start:
@@ -512,8 +541,23 @@ def _player_sort_key(meta, pid):
     return (_POS_RANK.get(info.get("position_id"), 9), info.get("name") or "", pid)
 
 
+def _greedy_units(units, limit):
+    """Highest 5-on-5 time first. A picked group removes its players."""
+    chosen, used = [], set()
+    for seconds, pids in units:
+        players = set(pids)
+        if players & used:
+            continue
+        chosen.append((seconds, pids))
+        used |= players
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
 def _rank_units(trio, pair, meta, min_seconds) -> dict:
     out = {}
+    limits = {"f": MAX_FORWARD_LINES, "d": MAX_DEFENSE_PAIRS}
 
     def emit(counter, prefix):
         grouped = {}
@@ -525,7 +569,7 @@ def _rank_units(trio, pair, meta, min_seconds) -> dict:
             units.sort(key=lambda item: (-item[0], item[1]))
             bucket = out.setdefault(team, {"lines": [], "pairs": []})
             key = "lines" if prefix == "f" else "pairs"
-            for i, (seconds, pids) in enumerate(units, start=1):
+            for i, (seconds, pids) in enumerate(_greedy_units(units, limits[prefix]), start=1):
                 ordered = sorted(pids, key=lambda pid: _player_sort_key(meta, pid))
                 bucket[key].append({
                     "group_id": f"{prefix}{i}",
@@ -886,15 +930,76 @@ def _blank():
     return {"errors": 0, "unmatched": 0, "new": 0, "changed": 0, "closed": 0, "same": 0}
 
 
+def _player_key(nhl_id, dfo_id, name):
+    if nhl_id:
+        return ("nhl", int(nhl_id))
+    if dfo_id:
+        return ("dfo", int(dfo_id))
+    return ("name", norm_name(name))
+
+
+def _shares_player(groups) -> bool:
+    seen = set()
+    for players in groups.values():
+        if seen & players:
+            return True
+        seen |= players
+    return False
+
+
+def _line_events(conn):
+    """Open official line events, split into settled and any-lines.
+
+    Settled means every team that has rows is within the caps and no player
+    is on two forward lines or two defense pairs. A game in the nightly
+    window whose rows are not settled is read again once and replaced.
+    Games outside the window are never selected.
+    """
+    buckets = {}
+    for eid, team, group, nhl_id, dfo_id, name in conn.execute(
+            "SELECT espn_event_id, team_id, group_id, nhl_player_id, dfo_player_id, name "
+            "FROM nhl_line_states WHERE source = ? AND valid_to IS NULL "
+            "AND espn_event_id IS NOT NULL", (NHL_SOURCE,)):
+        buckets.setdefault(eid, {}).setdefault(team, {}).setdefault(group, set()).add(
+            _player_key(nhl_id, dfo_id, name))
+    settled = set()
+    for eid, teams in buckets.items():
+        ok = True
+        for groups in teams.values():
+            forward = {g: pids for g, pids in groups.items() if str(g).startswith("f")}
+            defense = {g: pids for g, pids in groups.items() if str(g).startswith("d")}
+            if (len(forward) > MAX_FORWARD_LINES or len(defense) > MAX_DEFENSE_PAIRS
+                    or _shares_player(forward) or _shares_player(defense)):
+                ok = False
+                break
+        if ok:
+            settled.add(eid)
+    return settled, set(buckets)
+
+
+def _chart_confirmed_empty(last_seen, start_utc) -> bool:
+    """True once a fetch with no lines has been stored past the wait."""
+    started = _when(start_utc)
+    seen = _when(last_seen)
+    if started is None or seen is None:
+        return False
+    return seen >= started + timedelta(hours=EMPTY_CHART_HOURS)
+
+
 def _pending_nhl(conn, start, end):
-    """Completed games in the window that do not yet have both official starters."""
-    done = set()
-    for eid, n in conn.execute(
-            "SELECT espn_event_id, COUNT(DISTINCT team_id) FROM nhl_goalie_states "
-            "WHERE source = ? AND valid_to IS NULL AND espn_event_id IS NOT NULL "
-            "GROUP BY espn_event_id", (NHL_SOURCE,)):
-        if n >= 2:
-            done.add(eid)
+    """Completed games in the window that still need starters or lines.
+
+    Done means both official starters are stored and the lines are settled.
+    Starters with no lines are retried until a fetch at least
+    ``EMPTY_CHART_HOURS`` after the opening faceoff still finds none.
+    """
+    starters = {}
+    for eid, n, seen in conn.execute(
+            "SELECT espn_event_id, COUNT(DISTINCT team_id), MAX(last_seen) "
+            "FROM nhl_goalie_states WHERE source = ? AND valid_to IS NULL "
+            "AND espn_event_id IS NOT NULL GROUP BY espn_event_id", (NHL_SOURCE,)):
+        starters[eid] = (n, seen)
+    settled, present = _line_events(conn)
     rows = conn.execute(
         "SELECT espn_event_id, game_date, home_team_id, away_team_id, start_time_utc "
         "FROM games WHERE league = 'nhl' AND season_type IN (2, 3) "
@@ -903,7 +1008,11 @@ def _pending_nhl(conn, start, end):
         (start.isoformat(), end.isoformat()))
     out = []
     for eid, day, home, away, start_utc in rows:
-        if eid in done:
+        n, seen = starters.get(eid, (0, None))
+        if n >= 2 and eid in settled:
+            continue
+        # Starters are in, and a fetch after the wait still produced no lines.
+        if n >= 2 and eid not in present and _chart_confirmed_empty(seen, start_utc):
             continue
         out.append({
             "espn_event_id": eid, "game_date": str(day)[:10],
@@ -922,6 +1031,14 @@ def _when(stamp):
     if got.tzinfo is None:
         got = got.replace(tzinfo=timezone.utc)
     return got
+
+
+def _touch_goalies(conn, eid, at):
+    """Remember when a fetch stored starters and no lines."""
+    conn.execute(
+        "UPDATE nhl_goalie_states SET last_seen = ? "
+        "WHERE espn_event_id = ? AND source = ? AND valid_to IS NULL",
+        (at, eid, NHL_SOURCE))
 
 
 def _pick_game(pending, indexed):
@@ -1050,7 +1167,13 @@ def _game_rows(box, shifts, names, side_ids, eid, day, nhl_id):
 
 
 def refresh_nhl(conn, client, today, log, now, deadline):
-    """Official starters, forward lines, and defense pairs for new final games."""
+    """Official starters, forward lines, and defense pairs for final games.
+
+    A game is fetched until both starters and a settled line set are stored.
+    An empty shift chart keeps the starters and is tried on a later night
+    until a fetch at least ``EMPTY_CHART_HOURS`` after the opening faceoff
+    still has no lines. Failures are counted and skipped.
+    """
     start, end = _window(today)
     goalies, lines = _blank(), _blank()
     goalies["games"] = 0
@@ -1126,7 +1249,11 @@ def refresh_nhl(conn, client, today, log, now, deadline):
                 for team_id, team_rows in by_team.items():
                     _add(lines, apply_lines(conn, team_id, team_rows, at, row["espn_event_id"]))
                     lines["teams"] += 1
+                if not by_team:
+                    _touch_goalies(conn, row["espn_event_id"], at)
             goalies["games"] += 1
+            if not by_team:
+                log(f"nhl official {label} shift chart has no lines")
         except Exception as e:
             goalies["errors"] += 1
             log(f"nhl official {label} write ERROR {type(e).__name__}: {e}")
