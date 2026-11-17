@@ -271,7 +271,13 @@ MIN_TEAM_GAMES = 5
 def exhibition_team_ids(conn: sqlite3.Connection, league: str = None) -> set:
     """Team ids with fewer than MIN_TEAM_GAMES regular/postseason games in
     their league (All-Star squads, 4 Nations countries). Same rule read_games
-    uses for the model."""
+    uses for the model.
+
+    College football and men's college basketball are not filtered this way.
+    An FBS or Division I game can be against a team that appears once
+    (an FCS or non-Division I opponent). That game stays in the logs."""
+    if league in ("cfb", "cbb"):
+        return set()
     q = ("SELECT t FROM (SELECT home_team_id t FROM games WHERE season_type "
          "IN (2,3) {w} UNION ALL SELECT away_team_id FROM games WHERE "
          "season_type IN (2,3) {w}) GROUP BY t HAVING COUNT(*) < ?")

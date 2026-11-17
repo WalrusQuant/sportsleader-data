@@ -1,6 +1,6 @@
 # sportsleader-data
 
-Parquet files of game, player, team, and roster data for MLB, NBA, NFL, and NHL. One file per league, data set, and season. Rebuilt every night.
+Parquet files of game, player, team, and roster data for MLB, NBA, NFL, NHL, college football, and men's college basketball. One file per league, data set, and season. Current seasons are rebuilt every night. Older college seasons are added by a backfill that is started by hand.
 
 Downloads are GitHub Release assets. A file keeps the same URL when a new copy is published.
 
@@ -25,10 +25,13 @@ A client can read the manifest and download a file only when its `sha256` has ch
 
 ## Coverage
 
-ESPN data from 2021 on.
+ESPN data from 2021 on. Men's college basketball also includes the 2020-21 season.
 
-- MLB and NFL seasons start at 2021. The season number is the year the season starts.
+- MLB, NFL, and college football (`cfb`) seasons start at 2021. The season number is the year the season starts.
 - NBA and NHL start at the 2021-22 season. The season number is the year the season ends, so 2021-22 is `2022`.
+- Men's college basketball (`cbb`) starts at the 2020-21 season. The season number is the year the season ends, so 2020-21 is `2021`.
+
+College football is FBS only (ESPN group 80), including games against FCS teams and bowls. Men's college basketball is Division I (ESPN group 50), including games against non-Division I teams and the postseason. A college season file is created by the backfill workflow below. The nightly update then refreshes that current season.
 
 Ids in the files are ESPN ids.
 
@@ -44,17 +47,17 @@ Column names and types for each file are in the manifest. This page does not rep
 
 | Data set | Leagues | What it holds |
 |---|---|---|
-| `games` | mlb, nba, nfl, nhl | Schedule and results, one row per game (upcoming games have no score). |
-| `team_box_scores` | mlb, nba, nfl, nhl | ESPN team box line, one row per team per game. |
-| `team_game_stats` | mlb, nba, nfl, nhl | Full team counting stats for and against, one row per team per game. |
-| `player_game_logs` | nba | NBA box line, one row per player per game. |
+| `games` | mlb, nba, nfl, nhl, cfb, cbb | Schedule and results, one row per game (upcoming games have no score). |
+| `team_box_scores` | mlb, nba, nfl, nhl, cfb, cbb | ESPN team box line, one row per team per game. College rows use the pro columns and leave a stat blank when ESPN does not send it. |
+| `team_game_stats` | mlb, nba, nfl, nhl, cfb, cbb | Full team counting stats for and against, one row per team per game. College football follows the NFL columns. College basketball follows the NBA columns. |
+| `player_game_logs` | nba, cbb | NBA and men's college basketball box line, one row per player per game. College rows leave plus/minus blank. |
 | `skater_game_logs` | nhl | NHL skater box line, one row per player per game. |
 | `goalie_game_logs` | nhl | NHL goalie box line, one row per goalie per game. |
 | `batting_game_logs` | mlb | MLB batting line, one row per batter per game. |
 | `pitching_game_logs` | mlb | MLB pitching line, one row per pitcher per game. |
-| `passing_game_logs` | nfl | NFL passing line, one row per passer per game. |
-| `rushing_game_logs` | nfl | NFL rushing line, one row per rusher per game. |
-| `receiving_game_logs` | nfl | NFL receiving line, one row per receiver per game. |
+| `passing_game_logs` | nfl, cfb | NFL and college football passing line, one row per passer per game. College rows have QBR. Sacks, sack yards, and passer rating are blank when ESPN does not send them. |
+| `rushing_game_logs` | nfl, cfb | NFL and college football rushing line, one row per rusher per game. |
+| `receiving_game_logs` | nfl, cfb | NFL and college football receiving line, one row per receiver per game. College rows leave targets blank. |
 | `rosters` | mlb, nba, nfl, nhl | ESPN roster entries with the time span each was current (valid_to empty = still current). |
 | `injuries` | mlb, nba, nfl, nhl | Injury entries: ESPN (all leagues), NBA official report, NFL practice report. |
 | `transactions` | mlb, nba, nfl, nhl | Transactions: ESPN (all leagues) and MLB official. |
@@ -65,9 +68,20 @@ Column names and types for each file are in the manifest. This page does not rep
 
 ## Update schedule
 
-Every day at about 4:00 AM America/Chicago, from GitHub Actions in this repo. The job loads the current-season Parquet files and refreshes the last two days of games, team box scores, team game stats, and player game logs. It also refreshes current ESPN rosters, new ESPN injury details, ESPN transactions, NFL depth charts, and ESPN probables and weather. NBA.com starting lineups are refreshed for the last eight days through the next day. NHL starters, forward lines, and defense pairs are read from the official NHL API for completed games in that same window that do not already have both the official starters and the lines. A game whose shift chart is empty is read again on a later night until 48 hours after the opening faceoff. A changed file is published again at the same URL. Older seasons are left in place.
+Every day at about 4:00 AM America/Chicago, from GitHub Actions in this repo. The job loads the current-season Parquet files and refreshes the last two days of games, team box scores, team game stats, and player game logs. Summary requests run a few at a time, and only for games that are new or whose score changed. College football and men's college basketball join that run after their current-season files have been published. A backfill of an older college season does not by itself start the nightly college update. It also refreshes current ESPN rosters, new ESPN injury details, ESPN transactions, NFL depth charts, and ESPN probables and weather. NBA.com starting lineups are refreshed for the last eight days through the next day. NHL starters, forward lines, and defense pairs are read from the official NHL API for completed games in that same window that do not already have both the official starters and the lines. A game whose shift chart is empty is read again on a later night until 48 hours after the opening faceoff. A changed file is published again at the same URL. Older seasons are left in place.
 
 NBA official injury reports, NFL practice reports, MLB Stats API transactions, and National Weather Service forecasts are not re-fetched. Rows already published from those sources stay in the files. If a lineup page is missing or the source blocks the fetch, that page is logged and skipped. The rest of the nightly publish still runs.
+
+## Backfill one season
+
+`.github/workflows/backfill.yml` builds one league and one season, then uploads that season's files. It does not run on a schedule. Run it again to continue a failed season: finished dates stay in the cached database. Add `-f force=true` only when that season should be rebuilt and uploaded again.
+
+College football seasons are 2021 through the current season. Men's college basketball seasons are 2021 (2020-21) through the current season. The current season has to be backfilled once before the nightly job will refresh it.
+
+```
+gh workflow run backfill.yml --repo WalrusQuant/sportsleader-data -f league=cfb -f season=2024
+gh workflow run backfill.yml --repo WalrusQuant/sportsleader-data -f league=cbb -f season=2025
+```
 
 ## License and attribution
 

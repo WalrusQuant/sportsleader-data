@@ -1,6 +1,11 @@
 """Nightly update. Load the current-season release files, refresh the last
 two days from ESPN, export, and upload only the files that changed.
 
+College football and men's college basketball are included once a season
+file is already published. Summaries are fetched a few at a time, and only
+for games that are new or whose score changed. The manifest is re-read
+immediately before it is written.
+
     python -m bayesratings.nightly --dry-run
 
 Rosters, depth charts, ESPN transactions, and new ESPN injury details are
@@ -34,7 +39,7 @@ from .export import BOX, COUNT_NAMES, SEASON_TYPES
 
 OWNER_REPO = "WalrusQuant/sportsleader-data"
 RELEASE = f"https://github.com/{OWNER_REPO}/releases/download"
-LEAGUES = ("mlb", "nba", "nfl", "nhl")
+LEAGUES = ("mlb", "nba", "nfl", "nhl", "cfb", "cbb")
 UPDATE = (
     "games", "team_box_scores", "team_game_stats",
     "player_game_logs", "skater_game_logs", "goalie_game_logs",
@@ -51,6 +56,14 @@ LOG_TABLE = {
     "passing_game_logs": "player_game_nfl_passing",
     "rushing_game_logs": "player_game_nfl_rushing",
     "receiving_game_logs": "player_game_nfl_receiving",
+}
+# College logs share the dataset name and the column layout, and live in
+# their own tables so an NFL export cannot pick up a college row.
+COLLEGE_LOG_TABLE = {
+    ("cbb", "player_game_logs"): "player_game_cbb",
+    ("cfb", "passing_game_logs"): "player_game_cfb_passing",
+    ("cfb", "rushing_game_logs"): "player_game_cfb_rushing",
+    ("cfb", "receiving_game_logs"): "player_game_cfb_receiving",
 }
 # Parquet column -> database column. Bools are stored as 0/1.
 LOG_RENAME = {
@@ -109,6 +122,39 @@ def log(msg):
     print(msg, flush=True)
 
 
+def leagues_to_update(manifest, leagues=LEAGUES, today=None):
+    """Leagues the nightly job should refresh.
+
+    Pro leagues are included when any games file is published (that is the
+    current season). College is included only when the season in progress
+    already has a games file. A backfill of 2021 must not let the nightly job
+    publish a three-day stub as the current season."""
+    today = today or datetime.now(export.CENTRAL).date()
+    have = {}
+    for entry in (manifest or {}).get("files") or []:
+        if entry.get("dataset") != "games":
+            continue
+        try:
+            season = int(entry.get("season"))
+        except (TypeError, ValueError):
+            continue
+        have.setdefault(entry.get("league"), set()).add(season)
+    out = []
+    for lg in leagues:
+        seasons = have.get(lg) or set()
+        if not seasons:
+            continue
+        if lg in ("cfb", "cbb"):
+            if backfill.current_season(lg, today) not in seasons:
+                continue
+        out.append(lg)
+    return out
+
+
+def log_table(league, dataset):
+    return COLLEGE_LOG_TABLE.get((league, dataset), LOG_TABLE[dataset])
+
+
 def empty(v):
     if v is None:
         return True
@@ -146,13 +192,18 @@ def download(url, dest: Path):
     urllib.request.urlretrieve(url, dest)
 
 
-def current_files(manifest):
+def current_files(manifest, leagues=None):
+    allowed = None if leagues is None else set(leagues)
     latest = {}
     for entry in manifest["files"]:
+        if allowed is not None and entry["league"] not in allowed:
+            continue
         latest[entry["league"]] = max(latest.get(entry["league"], 0), int(entry["season"]))
     keep = set(UPDATE) | set(SNAPSHOTS)
     wanted = []
     for entry in manifest["files"]:
+        if entry["league"] not in latest:
+            continue
         if entry["dataset"] in keep and int(entry["season"]) == latest[entry["league"]]:
             wanted.append(entry)
     return latest, wanted
@@ -268,7 +319,7 @@ def load_stats(conn, teams, league, frame):
 
 
 def load_log(conn, teams, league, dataset, frame):
-    table = LOG_TABLE[dataset]
+    table = log_table(league, dataset)
     rename = LOG_RENAME[dataset]
     cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
     order = {}
@@ -423,20 +474,6 @@ def file_entry(old, path, rel, diff):
     }
 
 
-def with_urls(manifest):
-    files = []
-    for entry in manifest["files"]:
-        item = dict(entry)
-        item.pop("_diff", None)
-        item["url"] = gh_publish.asset_url(item["league"], item["dataset"], item["season"])
-        files.append(item)
-    out = dict(manifest)
-    out["files"] = files
-    out["manifest_url"] = gh_publish.manifest_url()
-    out["generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    return out
-
-
 def run(dry_run=False, cache=None):
     t0 = time.perf_counter()
     cache = Path(cache or Path.home() / ".cache" / "sportsleader-data")
@@ -447,8 +484,9 @@ def run(dry_run=False, cache=None):
     manifest_path = raw / "manifest.json"
     download(f"{RELEASE}/manifest/manifest.json", manifest_path)
     manifest = json.loads(manifest_path.read_text())
-    latest, wanted = current_files(manifest)
-    log(f"current seasons {latest}; {len(wanted)} current-season files")
+    update_leagues = leagues_to_update(manifest)
+    latest, wanted = current_files(manifest, update_leagues)
+    log(f"current seasons {latest}; {len(wanted)} current-season files; leagues {update_leagues}")
     local = {}
     for entry in wanted:
         dest = raw / entry["league"] / entry["dataset"] / f"{entry['season']}.parquet"
@@ -475,13 +513,15 @@ def run(dry_run=False, cache=None):
     today = datetime.now(export.CENTRAL).date()
     dates = [today - timedelta(days=2), today - timedelta(days=1), today]
     log(f"ingest {dates[0]} .. {dates[-1]}")
-    stats = backfill.run(conn, list(LEAGUES), 0, rate=0.0, today=today, only_dates=dates)
+    stats = backfill.run(
+        conn, update_leagues, 0, rate=0.0, today=today, only_dates=dates,
+        summary_workers=backfill.SUMMARY_WORKERS)
     log(f"scoreboards+summaries {stats} at {time.perf_counter() - t0:.1f}s")
     conn.commit()
     conn.isolation_level = None
-    player_stats = players.extract(conn, list(LEAGUES), log=log)
-    box_stats = teambox.extract(conn, list(LEAGUES), log=log)
-    lab_stats = labstats.extract(conn, list(LEAGUES), log=log)
+    player_stats = players.extract(conn, update_leagues, log=log)
+    box_stats = teambox.extract(conn, update_leagues, log=log)
+    lab_stats = labstats.extract(conn, update_leagues, log=log)
     snap = snapshots.refresh(conn, log=log)
     snapshots.restore(conn, seen)
     conn.close()
@@ -490,7 +530,7 @@ def run(dry_run=False, cache=None):
     for child in out.glob("*"):
         if child.is_file():
             child.unlink()
-    exported = export.run(str(db_path), out, leagues=LEAGUES,
+    exported = export.run(str(db_path), out, leagues=tuple(update_leagues),
                           datasets=set(UPDATE) | set(SNAPSHOTS), log=log)
     by_path = {entry["path"]: entry for entry in manifest["files"]}
     report = []
@@ -517,8 +557,6 @@ def run(dry_run=False, cache=None):
             changed.append((rel, new_path, fresh))
         log(f"  {rel}: +{diff['rows_added']} ~{diff['rows_updated']} -{diff['rows_removed']}")
 
-    merged = with_urls({**manifest, "files": sorted(by_path.values(), key=lambda f: f["path"])})
-    man_bytes = (json.dumps(merged, indent=1) + "\n").encode()
     total = time.perf_counter() - t0
     log(f"TOTAL {total:.1f}s; {len(changed)} files would upload; dry_run={dry_run}")
     log("not re-fetched: " + "; ".join(snapshots.NOT_REFRESHED))
@@ -533,8 +571,15 @@ def run(dry_run=False, cache=None):
             f"{fresh['league']}_{fresh['dataset']}", f"{fresh['season']}.parquet",
             path.read_bytes(), f"sha256:{fresh['sha256']}")
         log(f"uploaded {rel}")
-    gh_publish.replace_asset("manifest", "manifest.json", man_bytes,
-                             f"sha256:{hashlib.sha256(man_bytes).hexdigest()}")
+    # The manifest read at the start of this run is minutes old. Re-read and
+    # merge only the files this run uploaded so a backfill that landed in
+    # between is kept.
+    gh_publish.commit_manifest(
+        [fresh for _, _, fresh in changed],
+        export.dataset_catalog,
+        fetch=gh_publish.fetch_manifest,
+        upload=gh_publish.upload_manifest,
+    )
     log("uploaded manifest")
     return {"seconds": round(total, 1), "changed": [c[0] for c in changed], "uploaded": True}
 
@@ -547,7 +592,7 @@ def main(argv=None):
     try:
         result = run(dry_run=args.dry_run, cache=args.cache or None)
     except Exception as e:
-        log(f"FAIL {type(e).__name__}: {e}")
+        log(f"FAIL {backfill.public_error(e)}")
         return 1
     log(json.dumps({k: result[k] for k in ("seconds", "changed")}, default=str))
     return 0

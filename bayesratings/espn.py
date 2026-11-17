@@ -1,4 +1,5 @@
-# ESPN scoreboard client + parser for the four major leagues.
+# ESPN scoreboard client + parser for the four major leagues, FBS college
+# football, and Division I men's college basketball.
 #
 # Pure fetch + parse: this module hits the network and turns ESPN JSON into
 # rows; it never touches the DB (db.ingest_scoreboard does that). Stdlib only —
@@ -30,6 +31,17 @@ LEAGUES = {
     "nfl": {"sport": "football",   "league": "nfl", "season_convention": "start"},
     "nba": {"sport": "basketball", "league": "nba", "season_convention": "end"},
     "nhl": {"sport": "hockey",     "league": "nhl", "season_convention": "end"},
+    # FBS only (group 80), including FBS-vs-FCS games and bowls. The season
+    # number is the year the season starts, same as the NFL.
+    "cfb": {"sport": "football", "league": "college-football",
+            "season_convention": "start", "groups": 80, "limit": 300,
+            "team_limit": 500},
+    # Division I (group 50). A Saturday can list about 200 games, so the
+    # scoreboard limit stays well above that. The season number is the year
+    # the season ends, same as the NBA (2020-21 is 2021).
+    "cbb": {"sport": "basketball", "league": "mens-college-basketball",
+            "season_convention": "end", "groups": 50, "limit": 500,
+            "team_limit": 500},
 }
 
 
@@ -69,19 +81,36 @@ def _get(url: str, params: dict = None, retries: int = 4,
     raise RuntimeError(f"unreachable retry loop for {url}")
 
 
+def scoreboard_params(league: str, dates: str = None, week: int = None,
+                      seasontype: int = None, limit: int = None) -> dict:
+    """Query for one scoreboard. Pro leagues stay on limit 300 with no group.
+    College football asks for FBS. College basketball asks for Division I
+    with a limit above the busiest slate."""
+    cfg = LEAGUES[league]
+    if limit is None:
+        limit = cfg.get("limit", 300)
+    params = {"dates": dates, "week": week, "seasontype": seasontype, "limit": limit}
+    if cfg.get("groups") is not None:
+        params["groups"] = cfg["groups"]
+    return params
+
+
 def fetch_scoreboard(league: str, dates: str = None, week: int = None,
-                     seasontype: int = None, limit: int = 300) -> dict:
+                     seasontype: int = None, limit: int = None) -> dict:
     """Fetch a scoreboard payload. `dates` is YYYYMMDD or YYYYMMDD-YYYYMMDD;
-    `week`/`seasontype` drive NFL week-based queries."""
+    `week`/`seasontype` drive NFL week-based queries. `limit` defaults to the
+    league's own limit (300 for the pro leagues)."""
     cfg = LEAGUES[league]
     url = f"{SITE_API}/{cfg['sport']}/{cfg['league']}/scoreboard"
-    return _get(url, {"dates": dates, "week": week, "seasontype": seasontype,
-                      "limit": limit})
+    return _get(url, scoreboard_params(league, dates, week, seasontype, limit))
 
 
 def fetch_teams(league: str) -> dict:
     cfg = LEAGUES[league]
-    return _get(f"{SITE_API}/{cfg['sport']}/{cfg['league']}/teams")
+    params = None
+    if cfg.get("groups") is not None:
+        params = {"groups": cfg["groups"], "limit": cfg.get("team_limit", cfg.get("limit", 300))}
+    return _get(f"{SITE_API}/{cfg['sport']}/{cfg['league']}/teams", params)
 
 
 def fetch_summary(league: str, event_id: int) -> dict:

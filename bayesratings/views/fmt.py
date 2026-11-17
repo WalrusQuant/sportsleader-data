@@ -29,3 +29,8 @@ BOX_STATS = {
             ("pitching", "strikeouts", "pitcher strikeouts / game", 1, True),
             ("fielding", "errors", "errors / game", 2, False)],
 }
+# College boxes use the pro stat names. A name the college box does not send
+# stays blank. The lists are copied so a later edit to one league cannot
+# change the other.
+BOX_STATS["cfb"] = list(BOX_STATS["nfl"])
+BOX_STATS["cbb"] = list(BOX_STATS["nba"])

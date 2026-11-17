@@ -46,6 +46,9 @@ from zoneinfo import ZoneInfo
 
 VERSION = 2
 LEAGUES = ("mlb", "nba", "nfl", "nhl")
+# Games, team boxes, team stats, and the mirrored player logs. Rosters and the
+# other snapshot datasets stay on LEAGUES so college does not grow them.
+GAME_LEAGUES = LEAGUES + ("cfb", "cbb")
 CENTRAL = ZoneInfo("America/Chicago")
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = REPO / "data" / "export"
@@ -124,9 +127,15 @@ class Dataset:
     post: object = None       # optional row -> row
     doc: str = ""
     extra_cols: dict = field(default_factory=dict)   # league -> [(name, type)]
+    sql_by_league: dict = field(default_factory=dict)
 
     def columns(self, league):
         return self.cols + self.extra_cols.get(league, [])
+
+    def sql_for(self, league):
+        """Player logs share a dataset name across a pro league and its college
+        twin, with a different table for each. Other datasets use one SQL string."""
+        return (self.sql_by_league or {}).get(league) or self.sql
 
 
 def _team(alias, prefix):
@@ -159,9 +168,19 @@ def _player_log(table, league, stats, position_col=True):
     return sql, GAME_CTX + PLAYER + [(out, typ) for _, out, typ in stats]
 
 
-def _logs(name, table, league, stats, doc, position_col=True):
+def _logs(name, table, league, stats, doc, position_col=True, also=None):
+    """One player-log dataset. `also` maps a second league to its own table
+    when the exported columns are the same (college football, college basketball)."""
     sql, cols = _player_log(table, league, stats, position_col)
-    return Dataset(name, (league,), "game", sql, cols, doc=doc)
+    sql_by = {league: sql}
+    leagues = [league]
+    for lg, tbl in (also or {}).items():
+        extra_sql, extra_cols = _player_log(tbl, lg, stats, position_col)
+        if [c[0] for c in extra_cols] != [c[0] for c in cols]:
+            raise RuntimeError(f"{name} columns differ for {lg}")
+        sql_by[lg] = extra_sql
+        leagues.append(lg)
+    return Dataset(name, tuple(leagues), "game", sql, cols, doc=doc, sql_by_league=sql_by)
 
 
 NBA_STATS = [("starter", "starter", "bool"), ("did_not_play", "did_not_play", "bool"),
@@ -249,6 +268,9 @@ BOX = {
             (("batting", "walks"), "walks"), (("batting", "strikeouts"), "batting_strikeouts"),
             (("pitching", "strikeouts"), "pitching_strikeouts"), (("fielding", "errors"), "errors")],
 }
+# College team boxes use the pro columns. A stat the source does not send is blank.
+BOX["cfb"] = list(BOX["nfl"])
+BOX["cbb"] = list(BOX["nba"])
 BOX_FLOAT = {"fg_pct": "float", "fg3_pct": "float", "yards_per_play": "float",
              "faceoff_pct": "float"}
 BOX_SQL = (
@@ -322,6 +344,8 @@ COUNT_NAMES = {
             "bp_outs": "bullpen_outs", "bp_er": "bullpen_earned_runs", "po": "putouts",
             "a": "fielding_assists", "e": "errors", "dp": "double_plays"},
 }
+COUNT_NAMES["cfb"] = COUNT_NAMES["nfl"]
+COUNT_NAMES["cbb"] = COUNT_NAMES["nba"]
 STATS_SQL = (
     "SELECT s.league, s.season, s.season_type, s.espn_event_id AS game_id, s.game_date, "
     + _team("t", "team") + ", " + _team("o", "opponent") + ", s.is_home, "
@@ -524,16 +548,23 @@ def _ctx_cols(extra):
 
 
 DATASETS = [
-    Dataset("games", LEAGUES, "game", GAMES_SQL, GAMES_COLS,
-            doc="Schedule and results, one row per game (upcoming games have no score)."),
-    Dataset("team_box_scores", LEAGUES, "game", BOX_SQL, _ctx_cols([]),
-            extra_cols={lg: [(out, BOX_FLOAT.get(out, "int")) for _, out in BOX[lg]] for lg in LEAGUES},
-            doc="ESPN team box line, one row per team per game."),
-    Dataset("team_game_stats", LEAGUES, "game", STATS_SQL, _ctx_cols([]),
-            extra_cols={lg: _stats_cols(lg) for lg in LEAGUES},
-            doc="Full team counting stats for and against, one row per team per game."),
+    Dataset("games", GAME_LEAGUES, "game", GAMES_SQL, GAMES_COLS,
+            doc="Schedule and results, one row per game (upcoming games have no score). "
+                "College football is FBS, including games against FCS teams and bowls. "
+                "Men's college basketball is Division I, including games against "
+                "non-Division I teams and the postseason."),
+    Dataset("team_box_scores", GAME_LEAGUES, "game", BOX_SQL, _ctx_cols([]),
+            extra_cols={lg: [(out, BOX_FLOAT.get(out, "int")) for _, out in BOX[lg]] for lg in GAME_LEAGUES},
+            doc="ESPN team box line, one row per team per game. College rows use the "
+                "same columns as the pro league and leave a stat blank when ESPN does not send it."),
+    Dataset("team_game_stats", GAME_LEAGUES, "game", STATS_SQL, _ctx_cols([]),
+            extra_cols={lg: _stats_cols(lg) for lg in GAME_LEAGUES},
+            doc="Full team counting stats for and against, one row per team per game. "
+                "College football follows the NFL columns and college basketball follows the NBA columns."),
     _logs("player_game_logs", "player_game_nba", "nba", NBA_STATS,
-          "NBA box line, one row per player per game."),
+          "NBA and men's college basketball box line, one row per player per game. "
+          "College rows leave plus/minus blank; ESPN does not send it.",
+          also={"cbb": "player_game_cbb"}),
     _logs("skater_game_logs", "player_game_nhl_skater", "nhl", NHL_SKATER,
           "NHL skater box line, one row per player per game."),
     _logs("goalie_game_logs", "player_game_nhl_goalie", "nhl", NHL_GOALIE,
@@ -543,11 +574,16 @@ DATASETS = [
     _logs("pitching_game_logs", "player_game_mlb_pitching", "mlb", MLB_PITCH,
           "MLB pitching line, one row per pitcher per game."),
     _logs("passing_game_logs", "player_game_nfl_passing", "nfl", NFL_PASS,
-          "NFL passing line, one row per passer per game.", position_col=False),
+          "NFL and college football passing line, one row per passer per game. "
+          "College rows have QBR; sacks, sack yards and passer rating are blank when ESPN does not send them.",
+          position_col=False, also={"cfb": "player_game_cfb_passing"}),
     _logs("rushing_game_logs", "player_game_nfl_rushing", "nfl", NFL_RUSH,
-          "NFL rushing line, one row per rusher per game.", position_col=False),
+          "NFL and college football rushing line, one row per rusher per game.",
+          position_col=False, also={"cfb": "player_game_cfb_rushing"}),
     _logs("receiving_game_logs", "player_game_nfl_receiving", "nfl", NFL_REC,
-          "NFL receiving line, one row per receiver per game.", position_col=False),
+          "NFL and college football receiving line, one row per receiver per game. "
+          "College rows leave targets blank when ESPN does not send them.",
+          position_col=False, also={"cfb": "player_game_cfb_receiving"}),
     Dataset("rosters", LEAGUES, "state", ROSTERS_SQL, ROSTERS_COLS,
             doc="ESPN roster entries with the time span each was current (valid_to empty = still current)."),
     Dataset("injuries", LEAGUES, "state", INJ_SQL, INJ_COLS,
@@ -700,7 +736,7 @@ def _rows(conn, ds, league, season=None):
     params = {"league": league}
     if season is not None:
         params["season"] = season
-    cur = conn.execute(ds.sql, params)
+    cur = conn.execute(ds.sql_for(league), params)
     names = [c[0] for c in cur.description]
     post = _post_fn(ds, league)
     for r in cur:
@@ -790,7 +826,7 @@ def run(db_path, out, rebuild_all=False, leagues=LEAGUES, datasets=None, today=N
                 cols = ds.columns(league)
                 check_columns(ds.name, cols)
                 if ds.kind == "game":
-                    have = [r[0] for r in conn.execute(_seasons_sql(ds), {"league": league})]
+                    have = [r[0] for r in conn.execute(_seasons_sql(ds, league), {"league": league})]
                     groups = None
                 else:
                     groups = {}
@@ -842,13 +878,28 @@ def run(db_path, out, rebuild_all=False, leagues=LEAGUES, datasets=None, today=N
     return manifest
 
 
-def _seasons_sql(ds):
+def _seasons_sql(ds, league):
     table = {"games": "games", "team_box_scores": "games",
              "team_game_stats": "team_game_stats"}.get(ds.name)
     if table is None:                                      # player logs
-        table = ds.sql.split(" FROM ", 1)[1].split()[0]
+        table = ds.sql_for(league).split(" FROM ", 1)[1].split()[0]
         return f"SELECT DISTINCT season FROM {table} ORDER BY season"
     return f"SELECT DISTINCT season FROM {table} WHERE league = :league ORDER BY season"
+
+
+def dataset_catalog(files):
+    """Manifest `datasets` block. A league is listed once it has a file, so a
+    college league does not appear before its backfill. Descriptions come from
+    this code, which is what a nightly merge writes back."""
+    have = {}
+    for entry in files or []:
+        have.setdefault(entry.get("dataset"), set()).add(entry.get("league"))
+    out = {}
+    for ds in DATASETS:
+        leagues = [lg for lg in ds.leagues if lg in have.get(ds.name, ())]
+        if leagues:
+            out[ds.name] = {"leagues": leagues, "about": ds.doc}
+    return out
 
 
 def freshness(out, now=None, max_hours=26) -> tuple:
