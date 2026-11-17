@@ -1,6 +1,6 @@
 # sportsleader-data
 
-Parquet files of game, player, team, and roster data for MLB, NBA, NFL, NHL, college football, and men's college basketball. One file per league, data set, and season. Current seasons are rebuilt every night. Older college seasons are added by a backfill that is started by hand.
+Parquet files of game, player, team, and roster data for MLB, NBA, NFL, NHL, college football, and men's college basketball. One file per league, data set, and season. Current seasons are rebuilt every night. Older seasons are added by a backfill that is started by hand.
 
 Downloads are GitHub Release assets. A file keeps the same URL when a new copy is published.
 
@@ -25,11 +25,18 @@ A client can read the manifest and download a file only when its `sha256` has ch
 
 ## Coverage
 
-ESPN data from 2021 on. Men's college basketball also includes the 2020-21 season.
+Pro seasons go back to the first year ESPN's player box is reliable. College seasons start later. The nightly job refreshes only the current season. Older seasons are added by the backfill below.
 
-- MLB, NFL, and college football (`cfb`) seasons start at 2021. The season number is the year the season starts.
-- NBA and NHL start at the 2021-22 season. The season number is the year the season ends, so 2021-22 is `2022`.
-- Men's college basketball (`cbb`) starts at the 2020-21 season. The season number is the year the season ends, so 2020-21 is `2021`.
+- NFL from 1999. The season number is the year the season starts. 1998 has no games.
+- NBA from the 1993-94 season. The season number is the year the season ends, so 1993-94 is `1994`. The 1992-93 season has no player box.
+- NHL from the 1993-94 season (`1994`). The 1992-93 season has no games. There is no 2004-05 season (`2005`); it was not played.
+- MLB from 2003. The season number is the calendar year. 2002 has games and team lines and no player box.
+- College football (`cfb`) from 2021. The season number is the year the season starts.
+- Men's college basketball (`cbb`) from the 2020-21 season (`2021`). The season number is the year the season ends.
+
+On a pro season older than the original files (MLB and NFL before 2021, NBA and NHL before 2022), a final that ESPN reports as 0-0 with no team or player box is published with empty scores and status `final_no_data`. The game stays in the schedule. It is left out of the team box and team counting files. The coverage report counts these as `games_missing_score`. A current season is not changed. A stat that is missing or zero on every row is stored as null. That is how ESPN filled stats it did not track yet: NHL skater ice time in the 1990s, NBA plus/minus before 2008-09, NFL receiving targets before 2009, and MLB batter pitch counts through at least 2008. A zero next to any other value in that season stays zero. Current-season files are not rewritten by this rule.
+
+Each backfilled season also publishes a coverage report at `https://github.com/WalrusQuant/sportsleader-data/releases/download/coverage/<league>_<season>.json`. The manifest's `coverage` object points at it (`nba:1994` and the rest). The report has the game count, how many of those games had a player box, whether that share is under 95 percent, the stats that were stored as null, and the team abbreviation and name ESPN used that season. Relocated clubs keep that season's name (Seattle SuperSonics, Montreal Expos, Atlanta Thrashers, Hartford Whalers, Quebec Nordiques, Vancouver Grizzlies, Houston Oilers). A team on the current ESPN directory is not dropped for appearing a handful of times, and a team that played at least five games in the season is kept even if the franchise is gone.
 
 College football is FBS only (ESPN group 80), including games against FCS teams and bowls. Men's college basketball is Division I (ESPN group 50), including games against non-Division I teams and the postseason. A college season file is created by the backfill workflow below. The nightly update then refreshes that current season.
 
@@ -74,14 +81,38 @@ NBA official injury reports, NFL practice reports, MLB Stats API transactions, a
 
 ## Backfill one season
 
-`.github/workflows/backfill.yml` builds one league and one season, then uploads that season's files. It does not run on a schedule. Run it again to continue a failed season: finished dates stay in the cached database. Add `-f force=true` only when that season should be rebuilt and uploaded again.
+`.github/workflows/backfill.yml` builds one league and one season, then uploads that season's files and its coverage report. It does not run on a schedule and it is not in the nightly job's concurrency group. Summary requests run 4 at a time. A request that is rate limited or a server error is retried with backoff. The job limit is 180 minutes. The script stops after 150 minutes, before the next date, and prints `RESULT incomplete=1`. Run the same command again: finished dates stay in the cached database and the upload waits until the season window is done. Add `-f force=true` only when that season should be rebuilt and uploaded again.
 
-College football seasons are 2021 through the current season. Men's college basketball seasons are 2021 (2020-21) through the current season. The current season has to be backfilled once before the nightly job will refresh it.
+Start a run between 9:00 AM and 1:00 AM America/Chicago so it is finished before the 4:15 AM CT nightly job.
+
+One season:
 
 ```
 gh workflow run backfill.yml --repo WalrusQuant/sportsleader-data -f league=cfb -f season=2024
 gh workflow run backfill.yml --repo WalrusQuant/sportsleader-data -f league=cbb -f season=2025
+gh workflow run backfill.yml --repo WalrusQuant/sportsleader-data -f league=nfl -f season=1999
+gh workflow run backfill.yml --repo WalrusQuant/sportsleader-data -f league=nba -f season=1994
+gh workflow run backfill.yml --repo WalrusQuant/sportsleader-data -f league=nhl -f season=1994
+gh workflow run backfill.yml --repo WalrusQuant/sportsleader-data -f league=mlb -f season=2003
 ```
+
+Watch that run, then repeat the next season only after it finishes:
+
+```
+gh run list --repo WalrusQuant/sportsleader-data --workflow backfill.yml --limit 1 --json databaseId,status,url,createdAt
+gh run watch <run-id> --repo WalrusQuant/sportsleader-data --exit-status
+```
+
+A range for one league, newest missing season first and one run at a time. The commands below print the `gh` lines. Add `--run` to dispatch them and wait. NHL 2005 is skipped. `--run` will not start between 1:00 AM and 9:00 AM CT.
+
+```
+python -m bayesratings.queue_seasons --league nfl --from-season 2020 --to-season 1999 --print
+python -m bayesratings.queue_seasons --league nba --from-season 2021 --to-season 1994 --print
+python -m bayesratings.queue_seasons --league nhl --from-season 2021 --to-season 1994 --print
+python -m bayesratings.queue_seasons --league mlb --from-season 2020 --to-season 2003 --print
+```
+
+College football seasons are 2021 through the current season. Men's college basketball seasons are 2021 (2020-21) through the current season. The current season has to be backfilled once before the nightly job will refresh it. A backfill of an older season does not change the nightly league list.
 
 ## License and attribution
 

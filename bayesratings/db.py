@@ -63,7 +63,8 @@ _ADDED_COLUMNS = {
               "series_summary": "TEXT",
               "series_completed": "INTEGER NOT NULL DEFAULT 0",
               "venue_city": "TEXT", "venue_state": "TEXT", "venue_country": "TEXT"},
-    "teams": {"franchise_team_id": "INTEGER REFERENCES teams (team_id)"},
+    "teams": {"franchise_team_id": "INTEGER REFERENCES teams (team_id)",
+              "in_directory": "INTEGER NOT NULL DEFAULT 0"},
     "rating_snapshots": {"backfilled": "INTEGER NOT NULL DEFAULT 0"},
     "forecast_snapshots": {"backfilled": "INTEGER NOT NULL DEFAULT 0",
                            **_STARTER_AUDIT, **_PLAYER_AUDIT, **_STACK_AUDIT},
@@ -120,6 +121,10 @@ def _central_game_dates(conn: sqlite3.Connection) -> int:
 # on a slate. STATUS_REMOVED is ours: ESPN stopped listing the event (an "if
 # necessary" playoff game after a clinch, or a dropped fixture). Rows are kept.
 REMOVED = "STATUS_REMOVED"
+# A finished pro game whose scoreboard says 0-0 and whose summary has no team
+# or player box. The games file keeps the row (completed, scores empty) and
+# publishes this status. It is not a hidden status: the game was played.
+FINAL_NO_DATA = "final_no_data"
 HIDDEN_STATUSES = ("STATUS_POSTPONED", "STATUS_CANCELED", "STATUS_CANCELLED",
                    "STATUS_SUSPENDED", "STATUS_FORFEIT", REMOVED)
 HIDDEN_SQL = ", ".join(f"'{s}'" for s in HIDDEN_STATUSES)   # constants, safe to inline
@@ -141,18 +146,28 @@ COVID_SEASONS = {"mlb": {2020}, "nfl": {2020}, "nba": {2020, 2021},
 FRANCHISE_SUCCESSORS = {"nhl": {24: 129764}}   # Arizona Coyotes -> Utah
 
 
-def upsert_teams(conn: sqlite3.Connection, league: str, teams: list) -> dict:
+def upsert_teams(conn: sqlite3.Connection, league: str, teams: list,
+                 in_directory: bool = False) -> dict:
     """Insert/update teams for a league. `teams` is a list of dicts with
-    `espn_id` plus any display columns. Returns {espn_id: team_id}."""
+    `espn_id` plus any display columns. Returns {espn_id: team_id}.
+
+    `in_directory` is set for the league's /teams list and is never cleared
+    by a later scoreboard row. A franchise ESPN still lists under the
+    successor's id (SuperSonics as Oklahoma City, Expos as Washington) stays
+    in the directory, so a short sample of its games is not treated as an
+    exhibition."""
     # COALESCE so a partial payload (the scoreboard lacks location/alternate
     # color) never nulls out fuller data a /teams fetch already populated
     set_clause = ", ".join(f"{c} = COALESCE(excluded.{c}, teams.{c})"
                            for c in _TEAM_DISPLAY_COLS)
-    cols = ("league", "espn_id", *_TEAM_DISPLAY_COLS)
+    if in_directory:
+        set_clause += ", in_directory = 1"
+    cols = ("league", "espn_id", *_TEAM_DISPLAY_COLS, "in_directory")
     placeholders = ", ".join("?" for _ in cols)
     sql = (f"INSERT INTO teams ({', '.join(cols)}) VALUES ({placeholders}) "
            f"ON CONFLICT (league, espn_id) DO UPDATE SET {set_clause}")
-    rows = [(league, t["espn_id"], *(t.get(c) for c in _TEAM_DISPLAY_COLS))
+    flag = 1 if in_directory else 0
+    rows = [(league, t["espn_id"], *(t.get(c) for c in _TEAM_DISPLAY_COLS), flag)
             for t in teams]
     conn.executemany(sql, rows)
     conn.commit()
@@ -223,8 +238,9 @@ def ingest_scoreboard(conn: sqlite3.Connection, league: str, parsed: dict) -> in
     missing = [t for t in parsed.get("teams", [])
                if t["espn_id"] in seen and t["espn_id"] not in id_map]
     if missing:
-        id_map = upsert_teams(conn, league, missing)
+        id_map = upsert_teams(conn, league, missing, in_directory=False)
         link_franchises(conn, league)
+    _remember_season_names(conn, league, real, id_map, parsed.get("teams") or [])
     covid = COVID_SEASONS.get(league, set())
     rows = []
     skipped = []
@@ -261,31 +277,71 @@ def ingest_scoreboard(conn: sqlite3.Connection, league: str, parsed: dict) -> in
     return upsert_games(conn, rows)
 
 
-# A real franchise plays dozens of games a season; exhibition squads (NHL
-# All-Star divisions, 4 Nations countries) appear in at most a handful of
-# games in the whole history. Games involving such teams are left out of the
-# model. Rows stay in the DB.
+# A real franchise plays a season. Exhibition squads (NHL All-Star divisions,
+# 4 Nations countries) never reach MIN_TEAM_GAMES in any one season. The count
+# is per season, not across history: a franchise that played one full season
+# and then folded (or moved under the same ESPN id) is kept. A team that is
+# on the current /teams directory is kept even when this database has only a
+# few of its games so far. Rows stay in the DB either way.
 MIN_TEAM_GAMES = 5
 
 
+def _remember_season_names(conn, league, games, id_map, teams) -> None:
+    """Store the name and abbreviation ESPN used for this season.
+
+    The /teams directory carries the current franchise (Oklahoma City, not
+    Seattle). The scoreboard of an old season still says SuperSonics. Game
+    files prefer this row. A later call only fills a venue; it does not
+    replace the name."""
+    by_espn = {int(t["espn_id"]): t for t in teams}
+    rows = []
+    for game in games:
+        if game.get("season") is None:
+            continue
+        for espn_id in (game.get("home_espn_id"), game.get("away_espn_id")):
+            info = by_espn.get(espn_id)
+            tid = id_map.get(espn_id)
+            if not info or tid is None:
+                continue
+            rows.append((tid, league, int(game["season"]),
+                         info.get("name"), info.get("abbreviation")))
+    if not rows:
+        return
+    conn.executemany(
+        "INSERT INTO team_seasons (team_id, league, season, name, abbreviation, "
+        "home_games) VALUES (?, ?, ?, ?, ?, 0) "
+        "ON CONFLICT (team_id, season) DO UPDATE SET "
+        "name = COALESCE(excluded.name, team_seasons.name), "
+        "abbreviation = COALESCE(excluded.abbreviation, team_seasons.abbreviation)",
+        rows)
+    conn.commit()
+
+
 def exhibition_team_ids(conn: sqlite3.Connection, league: str = None) -> set:
-    """Team ids with fewer than MIN_TEAM_GAMES regular/postseason games in
-    their league (All-Star squads, 4 Nations countries). Same rule read_games
-    uses for the model.
+    """Team ids that never reach MIN_TEAM_GAMES in any one season and are not
+    on the current team directory (All-Star squads, 4 Nations countries).
 
     College football and men's college basketball are not filtered this way.
     An FBS or Division I game can be against a team that appears once
     (an FCS or non-Division I opponent). That game stays in the logs."""
     if league in ("cfb", "cbb"):
         return set()
-    q = ("SELECT t FROM (SELECT home_team_id t FROM games WHERE season_type "
-         "IN (2,3) {w} UNION ALL SELECT away_team_id FROM games WHERE "
-         "season_type IN (2,3) {w}) GROUP BY t HAVING COUNT(*) < ?")
+    where = "WHERE season_type IN (2, 3)"
+    params = []
     if league:
-        rows = conn.execute(q.format(w="AND league = ?"),
-                            (league, league, MIN_TEAM_GAMES))
-    else:
-        rows = conn.execute(q.format(w=""), (MIN_TEAM_GAMES,))
+        where += " AND league = ?"
+        params = [league, league]
+    params.append(MIN_TEAM_GAMES)
+    rows = conn.execute(
+        "SELECT team_id FROM ("
+        "SELECT team_id, season, COUNT(*) n FROM ("
+        f"SELECT home_team_id AS team_id, season FROM games {where} "
+        "UNION ALL "
+        f"SELECT away_team_id, season FROM games {where}) "
+        "GROUP BY team_id, season) "
+        "GROUP BY team_id HAVING MAX(n) < ? "
+        "AND team_id NOT IN (SELECT team_id FROM teams WHERE in_directory = 1)",
+        params)
     return {r[0] for r in rows}
 
 
@@ -320,18 +376,21 @@ def read_games(conn: sqlite3.Connection, league: str, seasons=None,
     if seasons:
         q.append(f"AND season IN ({', '.join('?' * len(seasons))})")
         params += list(seasons)
-    if exclude_exhibition:
+    if exclude_exhibition and league not in ("cfb", "cbb"):
         st = ", ".join(str(int(x)) for x in (season_types or (1, 2, 3)))
         q.append(
             "AND home_team_id NOT IN (SELECT team_id FROM exh) "
             "AND away_team_id NOT IN (SELECT team_id FROM exh)")
         q.insert(0, (
-            "WITH apps AS (SELECT home_team_id AS team_id FROM games "
+            "WITH season_apps AS (SELECT team_id, season, COUNT(*) n FROM ("
+            "SELECT home_team_id AS team_id, season FROM games "
             f"WHERE league = ? AND season_type IN ({st}) UNION ALL "
-            "SELECT away_team_id FROM games "
-            f"WHERE league = ? AND season_type IN ({st})), "
-            "exh AS (SELECT team_id FROM apps GROUP BY team_id "
-            f"HAVING COUNT(*) < {MIN_TEAM_GAMES})"))
+            "SELECT away_team_id, season FROM games "
+            f"WHERE league = ? AND season_type IN ({st})) "
+            "GROUP BY team_id, season), "
+            "exh AS (SELECT team_id FROM season_apps GROUP BY team_id "
+            f"HAVING MAX(n) < {MIN_TEAM_GAMES} "
+            "AND team_id NOT IN (SELECT team_id FROM teams WHERE in_directory = 1))"))
         params = [league, league] + params
     q.append("ORDER BY start_time_utc")
     return pd.read_sql_query(" ".join(q), conn, params=params)

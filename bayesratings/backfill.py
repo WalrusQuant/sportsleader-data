@@ -15,6 +15,11 @@ Preseason (season.type 1) and All-Star games are not stored.
 College football (`cfb`) is FBS, season = start year, from 2021.
 Men's college basketball (`cbb`) is Division I, season = end year, from 2021
 (the 2020-21 season).
+
+Pro history, verified against the scoreboard: NFL from 1999 (1998 has no
+games), NBA from 1994 (the 1993-94 season; 1992-93 has no player box), NHL
+from 1994 (1993-94; 1992-93 has no games), MLB from 2003 (2002 has games and
+no player lines). The one-season job is what publishes those years.
 """
 
 import argparse
@@ -34,9 +39,11 @@ RECHECK_DAYS = 2
 # How many summary requests may be in flight at once. The nightly job and the
 # one-season backfill use this. The plain CLI stays sequential unless asked.
 SUMMARY_WORKERS = 4
-# First season this repo publishes. cbb 2021 is the 2020-21 season.
+# First season a one-season backfill may publish. cbb 2021 is the 2020-21
+# season. NBA 1994 is 1993-94. NHL 1994 is 1993-94. The nightly job does not
+# read this; it only refreshes a season that is already in the manifest.
 FIRST_SEASON = {
-    "mlb": 2021, "nfl": 2021, "nba": 2022, "nhl": 2022,
+    "mlb": 2003, "nfl": 1999, "nba": 1994, "nhl": 1994,
     "cfb": 2021, "cbb": 2021,
 }
 
@@ -252,22 +259,30 @@ def load_summary(conn, event_id: int) -> dict:
 
 
 def refresh_team_seasons(conn, league: str) -> None:
-    """Rebuild team_seasons: each team's most-used non-neutral home venue per
-    season, plus its display name as last seen."""
-    conn.execute("DELETE FROM team_seasons WHERE league = ?", (league,))
-    conn.execute("""
-        INSERT INTO team_seasons (team_id, league, season, name, abbreviation,
-                                  home_venue, home_games)
-        SELECT v.home_team_id, v.league, v.season, t.name, t.abbreviation,
-               v.venue, v.n
-        FROM (SELECT home_team_id, league, season, venue, COUNT(*) n,
+    """Fill each team's main home venue for the season.
+
+    The scoreboard name stored on the way in is kept. A team with no
+    scoreboard name yet (a nightly load of a file that was already named)
+    gets the name on the teams row, which is the name that file used."""
+    rows = conn.execute("""
+        SELECT v.home_team_id, v.season, t.name, t.abbreviation, v.venue, v.n
+        FROM (SELECT home_team_id, season, venue, COUNT(*) n,
                      ROW_NUMBER() OVER (PARTITION BY home_team_id, season
                                         ORDER BY COUNT(*) DESC) rk
               FROM games WHERE league = ? AND neutral_site = 0
                 AND season_type = 2 AND venue IS NOT NULL
               GROUP BY home_team_id, season, venue) v
         JOIN teams t ON t.team_id = v.home_team_id
-        WHERE v.rk = 1""", (league,))
+        WHERE v.rk = 1""", (league,)).fetchall()
+    conn.executemany("""
+        INSERT INTO team_seasons (team_id, league, season, name, abbreviation,
+                                  home_venue, home_games)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (team_id, season) DO UPDATE SET
+            home_venue = excluded.home_venue,
+            home_games = excluded.home_games
+    """, [(team_id, league, season, name, abbr, venue, n)
+          for team_id, season, name, abbr, venue, n in rows])
     conn.commit()
 
 
@@ -325,8 +340,19 @@ def _store_fetched(conn, league, fetched) -> None:
         conn.commit()
 
 
+def past_deadline(deadline, now=None) -> bool:
+    """True when a one-season run should stop before the next date.
+
+    Stopping between dates leaves that date unfinished, so the next run
+    continues from the cache. `deadline` is a monotonic clock value."""
+    if deadline is None:
+        return False
+    return (time.monotonic() if now is None else now) >= deadline
+
+
 def run(conn, leagues, n_seasons, rate=1.0, today=None, only_dates=None,
-        est_games_per_date=None, summary_workers=1, only_season=None) -> dict:
+        est_games_per_date=None, summary_workers=1, only_season=None,
+        deadline=None) -> dict:
     today = today or date.today()
     pace = Pacer(rate)
     todo = plan(conn, leagues, n_seasons, today, only_dates)
@@ -337,17 +363,23 @@ def run(conn, leagues, n_seasons, rate=1.0, today=None, only_dates=None,
     }
     log(f"plan: {total_dates} dates to fetch "
         + ", ".join(f"{lg}={len(v)}" for lg, v in todo.items()))
-    stats = {"dates": 0, "games": 0, "summaries": 0, "errors": 0, "removed": 0}
+    stats = {"dates": 0, "games": 0, "summaries": 0, "errors": 0, "removed": 0,
+             "stopped_early": False}
     dates_left = total_dates
 
     for lg in leagues:
         started = _now()
         if not db.team_id_map(conn, lg):
-            db.upsert_teams(conn, lg, espn.parse_teams(pace(espn.fetch_teams, lg)))
+            db.upsert_teams(conn, lg, espn.parse_teams(pace(espn.fetch_teams, lg)),
+                            in_directory=True)
         db.link_franchises(conn, lg)
         lg_games = 0
         plog = {}
         for i, d in enumerate(todo[lg]):
+            if past_deadline(deadline):
+                stats["stopped_early"] = True
+                log(f"{lg} stopping before {d.isoformat()} so this run can finish")
+                break
             ds = d.isoformat()
             try:
                 params = espn.scoreboard_params(lg, dates=f"{d:%Y%m%d}")

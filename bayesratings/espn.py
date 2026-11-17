@@ -47,9 +47,12 @@ LEAGUES = {
 
 # ---------------------------------------------------------------- fetch core
 
-def _get(url: str, params: dict = None, retries: int = 4,
+def _get(url: str, params: dict = None, retries: int = 6,
          timeout: int = 30) -> dict:
-    """GET JSON with polite headers, gzip, and exponential backoff on 429/5xx."""
+    """GET JSON with polite headers, gzip, and exponential backoff on 429/5xx.
+
+    The retry message has no address. Callers log `public_error`, which also
+    drops anything that looks like a URL or a token."""
     if params:
         url = url + "?" + urllib.parse.urlencode(
             {k: v for k, v in params.items() if v is not None})
@@ -68,17 +71,19 @@ def _get(url: str, params: dict = None, retries: int = 4,
                 return json.loads(raw.decode())
         except urllib.error.HTTPError as e:
             if e.code in (429, 500, 502, 503, 504) and attempt < retries:
-                time.sleep(delay)
-                delay *= 2
+                time.sleep(min(delay, 32.0))
+                delay = min(delay * 2, 32.0)
                 continue
+            if e.code in (429, 500, 502, 503, 504):
+                break
             raise
         except (urllib.error.URLError, TimeoutError):
             if attempt < retries:
-                time.sleep(delay)
-                delay *= 2
+                time.sleep(min(delay, 32.0))
+                delay = min(delay * 2, 32.0)
                 continue
-            raise
-    raise RuntimeError(f"unreachable retry loop for {url}")
+            break
+    raise RuntimeError("scoreboard request failed after retries")
 
 
 def scoreboard_params(league: str, dates: str = None, week: int = None,
@@ -165,19 +170,60 @@ def _ending(league: str, status: dict, completed: bool):
     return "regulation"
 
 
+def clean_label(value):
+    """Collapse the padded names on old scoreboards ('New York        Islanders',
+    'LA ') to a single-spaced label. A missing value stays missing."""
+    if value is None:
+        return None
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    return text or None
+
+
 def _team_display(team: dict) -> dict:
     """Pull display fields from a team object (scoreboard competitor or /teams)."""
     logos = team.get("logos")
     logo = team.get("logo") or (logos[0]["href"] if logos else None)
     return {
         "espn_id": int(team["id"]),
-        "location": team.get("location"),
-        "name": team.get("displayName"),
-        "abbreviation": team.get("abbreviation"),
+        "location": clean_label(team.get("location")),
+        "name": clean_label(team.get("displayName")),
+        "abbreviation": clean_label(team.get("abbreviation")),
         "color": team.get("color"),
         "alternate_color": team.get("alternateColor"),
         "logo": logo,
     }
+
+
+def _shadow_tip(start) -> bool:
+    """Old duplicate events are stamped at 17:00 UTC exactly. A real tip time
+    is not."""
+    text = str(start or "")
+    return text.endswith("T17:00Z") or "T17:00:00Z" in text or "T17:00:00+00:00" in text
+
+
+def drop_shadow_duplicates(games: list) -> list:
+    """Drop a modern-id copy of a legacy event.
+
+    Around 1999-2001 the scoreboard sometimes lists the same matchup twice:
+    the legacy event id, which has the player box, and a 400000000+ id at
+    17:00 UTC with an empty box. A doubleheader is two legacy ids and stays.
+    A current-season event has only the modern id and stays."""
+    groups = {}
+    for game in games:
+        key = (game.get("season"), game.get("game_date"),
+               game.get("home_espn_id"), game.get("away_espn_id"))
+        groups.setdefault(key, []).append(game)
+    drop = set()
+    for items in groups.values():
+        legacy = [g for g in items if int(g["espn_event_id"]) < 400_000_000]
+        if not legacy:
+            continue
+        for game in items:
+            if int(game["espn_event_id"]) >= 400_000_000 and _shadow_tip(game.get("start_time_utc")):
+                drop.add(int(game["espn_event_id"]))
+    if not drop:
+        return games
+    return [g for g in games if int(g["espn_event_id"]) not in drop]
 
 
 # Exhibition events ESPN files as regular season (season.type 2): All-Star
@@ -257,7 +303,7 @@ def parse_scoreboard(data: dict, league: str) -> dict:
             })
         except (KeyError, TypeError, ValueError):
             continue
-    return {"teams": list(teams.values()), "games": games}
+    return {"teams": list(teams.values()), "games": drop_shadow_duplicates(games)}
 
 
 def parse_teams(data: dict) -> list:

@@ -20,6 +20,10 @@ CREATE TABLE IF NOT EXISTS teams (
     -- canonical franchise for ratings continuity across relocations where ESPN
     -- issued a new id (NHL Arizona 24 -> Utah 129764). NULL = itself.
     franchise_team_id INTEGER REFERENCES teams (team_id),
+    -- 1 when this row came from the league's /teams directory. A relocated
+    -- franchise keeps the successor's id (Sonics/Thunder, Expos/Nationals) and
+    -- stays in the directory. An all-star side added from one scoreboard does not.
+    in_directory    INTEGER NOT NULL DEFAULT 0,
     UNIQUE (league, espn_id)
 );
 

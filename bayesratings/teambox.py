@@ -57,11 +57,13 @@ def _pending(conn, league):
     return conn.execute(
         "SELECT g.espn_event_id, g.home_team_id, g.away_team_id, s.fetched_at "
         "FROM games g JOIN game_summaries s USING (espn_event_id) "
-        "WHERE g.league = ? AND g.completed = 1 AND EXISTS (SELECT 1 FROM ("
+        "WHERE g.league = ? AND g.completed = 1 "
+        "AND COALESCE(g.status, '') != ? AND EXISTS (SELECT 1 FROM ("
         "  SELECT g.home_team_id AS t UNION ALL SELECT g.away_team_id) x "
         "  WHERE NOT EXISTS (SELECT 1 FROM team_game_box b WHERE b.espn_event_id = g.espn_event_id "
         "  AND b.team_id = x.t AND b.version = ? AND b.summary_fetched_at = s.fetched_at)) "
-        "ORDER BY g.game_date, g.espn_event_id", (league, v)).fetchall()
+        "ORDER BY g.game_date, g.espn_event_id",
+        (league, db.FINAL_NO_DATA, v)).fetchall()
 
 
 def extract(conn, leagues=LEAGUES, log=print, batch=200):

@@ -26,6 +26,11 @@ on:
         required: false
         type: boolean
         default: false
+      max_dates:
+        description: Stop after this many scoreboard dates (empty = the whole season)
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -61,6 +66,7 @@ jobs:
           BACKFILL_LEAGUE: ${{ inputs.league }}
           BACKFILL_SEASON: ${{ inputs.season }}
           BACKFILL_FORCE: ${{ inputs.force }}
+          BACKFILL_MAX_DATES: ${{ inputs.max_dates }}
         run: |
           set -eu
           mkdir -p backfill-cache
@@ -68,11 +74,18 @@ jobs:
           if [ "$BACKFILL_FORCE" = "true" ]; then
             extra+=(--force)
           fi
+          if [ -n "$BACKFILL_MAX_DATES" ]; then
+            case "$BACKFILL_MAX_DATES" in
+              ''|*[!0-9]*) echo "max_dates must be a number"; exit 1 ;;
+            esac
+            extra+=(--max-dates "$BACKFILL_MAX_DATES")
+          fi
           python -m bayesratings.season_backfill \
             --league "$BACKFILL_LEAGUE" \
             --season "$BACKFILL_SEASON" \
             --cache backfill-cache \
             --summary-workers 4 \
+            --max-minutes 150 \
             "${extra[@]}"
       - uses: actions/cache/save@v4
         if: always() && inputs.force != true

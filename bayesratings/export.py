@@ -138,10 +138,24 @@ class Dataset:
         return (self.sql_by_league or {}).get(league) or self.sql
 
 
-def _team(alias, prefix):
-    """ESPN team id, abbreviation and name from teams (internal id stays in)."""
-    return (f"{alias}.espn_id AS {prefix}_id, {alias}.abbreviation AS {prefix}_abbr, "
-            f"{alias}.name AS {prefix}_name")
+def _team(alias, prefix, season_alias=None):
+    """ESPN team id, abbreviation and name. Internal team_id stays in the database.
+
+    `season_alias` is a team_seasons join. An old season's scoreboard name
+    (SuperSonics, Expos) wins over the current directory name."""
+    if season_alias:
+        abbr = f"COALESCE({season_alias}.abbreviation, {alias}.abbreviation)"
+        name = f"COALESCE({season_alias}.name, {alias}.name)"
+    else:
+        abbr = f"{alias}.abbreviation"
+        name = f"{alias}.name"
+    return (f"{alias}.espn_id AS {prefix}_id, {abbr} AS {prefix}_abbr, "
+            f"{name} AS {prefix}_name")
+
+
+def _season_name(alias, team_col, season_col):
+    return (f"LEFT JOIN team_seasons {alias} ON {alias}.team_id = {team_col} "
+            f"AND {alias}.season = {season_col}")
 
 
 GAME_CTX = [("league", "str"), ("season", "int"), ("season_type", "str"),
@@ -157,11 +171,13 @@ def _player_log(table, league, stats, position_col=True):
     pos = "COALESCE(x.position, p.position)" if position_col else "p.position"
     sel = ", ".join(f"x.{src} AS {out}" for src, out, _ in stats)
     sql = (f"SELECT :league AS league, x.season, x.season_type, x.espn_event_id AS game_id, "
-           f"x.game_date, {_team('t', 'team')}, {_team('o', 'opponent')}, x.is_home, "
+           f"x.game_date, {_team('t', 'team', 'ts')}, {_team('o', 'opponent', 'os')}, x.is_home, "
            f"x.athlete_id AS player_id, p.name AS player_name, {pos} AS position, {sel} "
            f"FROM {table} x "
            f"LEFT JOIN teams t ON t.team_id = x.team_id "
+           f"{_season_name('ts', 'x.team_id', 'x.season')} "
            f"LEFT JOIN teams o ON o.team_id = x.opp_team_id "
+           f"{_season_name('os', 'x.opp_team_id', 'x.season')} "
            f"LEFT JOIN players p ON p.league = :league AND p.athlete_id = x.athlete_id "
            f"WHERE x.season = :season "
            f"ORDER BY x.game_date, x.espn_event_id, x.team_id, x.athlete_id")
@@ -234,13 +250,15 @@ NFL_REC = [("rec", "receptions", "int"), ("tgt", "targets", "int"), ("yds", "yar
 GAMES_SQL = (
     "SELECT g.league, g.season, g.season_type, g.espn_event_id AS game_id, g.game_date, "
     "g.start_time_utc AS start_time, lower(replace(g.status, 'STATUS_', '')) AS status, "
-    "g.completed, " + _team("h", "home_team") + ", " + _team("a", "away_team") + ", "
+    "g.completed, " + _team("h", "home_team", "hs") + ", " + _team("a", "away_team", "as_") + ", "
     "CASE WHEN g.completed = 1 THEN g.home_score END AS home_score, "
     "CASE WHEN g.completed = 1 THEN g.away_score END AS away_score, "
     "g.ending, g.neutral_site, g.venue, g.venue_city, g.venue_state, g.venue_country, "
     "g.notes, g.series_summary, g.if_necessary "
     "FROM games g LEFT JOIN teams h ON h.team_id = g.home_team_id "
+    + _season_name("hs", "g.home_team_id", "g.season") + " "
     "LEFT JOIN teams a ON a.team_id = g.away_team_id "
+    + _season_name("as_", "g.away_team_id", "g.season") + " "
     "WHERE g.league = :league AND g.season = :season AND g.status != 'STATUS_REMOVED' "
     "ORDER BY g.start_time_utc, g.espn_event_id")
 GAMES_COLS = [("league", "str"), ("season", "int"), ("season_type", "str"), ("game_id", "int"),
@@ -275,16 +293,19 @@ BOX_FLOAT = {"fg_pct": "float", "fg3_pct": "float", "yards_per_play": "float",
              "faceoff_pct": "float"}
 BOX_SQL = (
     "SELECT g.league, g.season, g.season_type, g.espn_event_id AS game_id, g.game_date, "
-    + _team("t", "team") + ", " + _team("o", "opponent") + ", "
+    + _team("t", "team", "ts") + ", " + _team("o", "opponent", "os") + ", "
     "(g.home_team_id = b.team_id) AS is_home, "
     "CASE WHEN g.home_team_id = b.team_id THEN g.home_score ELSE g.away_score END AS score, "
     "CASE WHEN g.home_team_id = b.team_id THEN g.away_score ELSE g.home_score END AS opponent_score, "
     "b.stats_json AS _box "
     "FROM team_game_box b JOIN games g ON g.espn_event_id = b.espn_event_id "
     "LEFT JOIN teams t ON t.team_id = b.team_id "
+    + _season_name("ts", "b.team_id", "g.season") + " "
     "LEFT JOIN teams o ON o.team_id = CASE WHEN g.home_team_id = b.team_id "
     "THEN g.away_team_id ELSE g.home_team_id END "
+    + _season_name("os", "o.team_id", "g.season") + " "
     "WHERE b.league = :league AND g.season = :season "
+    "AND COALESCE(g.status, '') != 'final_no_data' "
     "ORDER BY g.game_date, g.espn_event_id, b.team_id")
 
 
@@ -348,11 +369,15 @@ COUNT_NAMES["cfb"] = COUNT_NAMES["nfl"]
 COUNT_NAMES["cbb"] = COUNT_NAMES["nba"]
 STATS_SQL = (
     "SELECT s.league, s.season, s.season_type, s.espn_event_id AS game_id, s.game_date, "
-    + _team("t", "team") + ", " + _team("o", "opponent") + ", s.is_home, "
+    + _team("t", "team", "ts") + ", " + _team("o", "opponent", "os") + ", s.is_home, "
     "s.points_for AS score, s.points_against AS opponent_score, s.counts_json AS _counts "
     "FROM team_game_stats s LEFT JOIN teams t ON t.team_id = s.team_id "
+    + _season_name("ts", "s.team_id", "s.season") + " "
     "LEFT JOIN teams o ON o.team_id = s.opp_team_id "
+    + _season_name("os", "s.opp_team_id", "s.season") + " "
     "WHERE s.league = :league AND s.season = :season "
+    "AND NOT EXISTS (SELECT 1 FROM games g WHERE g.espn_event_id = s.espn_event_id "
+    "AND g.status = 'final_no_data') "
     "ORDER BY s.game_date, s.espn_event_id, s.team_id")
 
 
@@ -816,6 +841,7 @@ def run(db_path, out, rebuild_all=False, leagues=LEAGUES, datasets=None, today=N
     conn = connect_ro(db_path)
     t0 = time.monotonic()
     written = skipped = 0
+    history_blanked = {}
     try:
         for league in leagues:
             seasons = Seasons(conn, league)
@@ -846,6 +872,14 @@ def run(db_path, out, rebuild_all=False, leagues=LEAGUES, datasets=None, today=N
                     rows = groups[season] if groups is not None else list(_rows(conn, ds, league, season))
                     if not rows:
                         continue
+                    blanked = []
+                    if ds.kind == "game":
+                        from . import coverage
+                        if coverage.blanks_history(league, season):
+                            stat_names = [name for name, typ in cols if typ in ("int", "float")]
+                            rows, blanked = coverage.blank_untracked(rows, stat_names)
+                    if blanked:
+                        history_blanked.setdefault(f"{league}/{season}", {})[ds.name] = blanked
                     table = _table(rows, cols, season)
                     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
                     _write_atomic(table, path, {"league": league, "dataset": ds.name,
@@ -875,6 +909,7 @@ def run(db_path, out, rebuild_all=False, leagues=LEAGUES, datasets=None, today=N
     _write_json_atomic(manifest, out / "manifest.json")
     log(f"export: {written} written, {skipped} unchanged, {len(files)} files, "
         f"{time.monotonic() - t0:.1f}s")
+    manifest["history_blanked"] = history_blanked
     return manifest
 
 
