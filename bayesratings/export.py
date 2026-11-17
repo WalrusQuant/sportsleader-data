@@ -561,7 +561,8 @@ DATASETS = [
                 "Played NHL games add the official starter (source nhl_api)."),
     Dataset("lineups", ("mlb", "nba", "nhl"), "state", LINEUP_SQL, LINEUP_COLS,
             doc="Announced lineups: MLB batting orders, NBA starting fives, "
-                "NHL even-strength lines and defense pairs (source nhl_api), ESPN pre-game."),
+                "NHL even-strength lines and defense pairs (source nhl_api, "
+                "top four lines and three pairs), ESPN pre-game."),
     Dataset("weather", ("mlb", "nfl"), "state", WX_SQL, WX_COLS,
             doc="Game weather: ESPN conditions and National Weather Service hourly outlook for the venue."),
 ]

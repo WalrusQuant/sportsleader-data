@@ -988,7 +988,8 @@ CREATE INDEX IF NOT EXISTS idx_nhl_goalie_date ON nhl_goalie_states (game_date, 
 CREATE INDEX IF NOT EXISTS idx_nhl_goalie_event ON nhl_goalie_states (espn_event_id);
 
 -- Line combinations. source daily_faceoff is a historical team chart with no game.
--- source nhl_api is one post-game 5v5 forward line or defense pair for one game.
+-- source nhl_api is one post-game 5v5 forward line (f1..f4) or defense pair
+-- (d1..d3) for one game. A player is on at most one line and one pair.
 CREATE TABLE IF NOT EXISTS nhl_line_states (
     id             INTEGER PRIMARY KEY,
     league         TEXT    NOT NULL DEFAULT 'nhl',

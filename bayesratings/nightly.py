@@ -7,7 +7,8 @@ Rosters, depth charts, ESPN transactions, and new ESPN injury details are
 refreshed from the copied prelog passes. Scoreboard probables and ESPN
 weather move with the game ingest. NBA.com lineups are refreshed for the
 recent window. Official NHL starters and even-strength lines are refreshed
-for completed games in that window that are not already in the file. A
+for completed games in that window that do not already have both. An empty
+shift chart is retried until 48 hours after the opening faceoff. A
 failure there is logged and does not stop the publish. See
 snapshots.NOT_REFRESHED for the sources that are kept but not re-fetched.
 """

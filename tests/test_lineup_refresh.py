@@ -9,13 +9,15 @@ recorded box score and shift chart.
 import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
 
 from bayesratings import db, export, snapshots
-from bayesratings.lineup_refresh import MIN_UNIT_SECONDS, Missing, build_units, norm_name, refresh
+from bayesratings.lineup_refresh import (
+    EMPTY_CHART_HOURS, MIN_UNIT_SECONDS, Missing, build_units, norm_name, refresh,
+)
 from bayesratings.nightly import Teams
 
 OLD = "2026-11-02T12:00:00+00:00"
@@ -118,6 +120,27 @@ SYN_SCHEDULE = {"gameWeek": [{"date": "2026-11-08", "games": [{
     "awayTeam": {"abbrev": "FLA", "placeName": {"default": "Florida"}, "commonName": {"default": "Panthers"}},
     "homeTeam": {"abbrev": "BOS", "placeName": {"default": "Boston"}, "commonName": {"default": "Bruins"}},
 }]}]}
+
+
+def _mmss(seconds) -> str:
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def _syn_positions():
+    positions = {}
+    for pid, first, last, pos in _BOS + _FLA:
+        kind = "D" if pos == "D" else "F"
+        positions[pid] = {"kind": kind, "position_id": pos.lower() if pos != "RW" else "rw",
+                          "name": f"{first} {last}"}
+    positions[301]["position_id"] = "rw"
+    positions[302]["position_id"] = "c"
+    positions[901]["position_id"] = "c"
+    for pid, pos in ((303, "rw"), (904, "c"), (905, "lw"), (906, "d"), (907, "d"),
+                     (902, "d"), (903, "d")):
+        positions[pid]["position_id"] = pos
+    positions[311] = {"kind": "G", "position_id": "g", "name": "Jeremy Swayman"}
+    positions[312] = {"kind": "G", "position_id": "g", "name": "Sergei Bobrovsky"}
+    return positions
 
 
 def _dump(payload) -> bytes:
@@ -350,20 +373,41 @@ class RefreshTest(unittest.TestCase):
         self.assertEqual(norm_name("J. J. Peterka"), norm_name("JJ Peterka"))
         self.assertEqual(norm_name("Moore Jr., Wendell"), "wendell moore")
 
+    def test_overlapping_lines_are_fetched_again(self):
+        at = "2026-11-09T12:00:00+00:00"
+        for tid, name, pid in ((3, "Jeremy Swayman", 311), (4, "Sergei Bobrovsky", 312)):
+            self.conn.execute(
+                "INSERT INTO nhl_goalie_states (league, game_date, dfo_team_id, team_id, "
+                "espn_event_id, goalie_name, athlete_id, strength, source, nhl_player_id, "
+                "raw_json, state_hash, valid_from, last_seen) "
+                "VALUES ('nhl', '2026-11-08', 0, ?, 8008, ?, ?, 'Confirmed', 'nhl_api', ?, "
+                "'{}', 'h', ?, ?)",
+                (tid, name, pid, pid, at, at))
+        for group in ("f1", "f2"):
+            self.conn.execute(
+                "INSERT INTO nhl_line_states (league, dfo_team_id, team_id, group_id, category, "
+                "dfo_player_id, nhl_player_id, athlete_id, name, position_id, source, "
+                "espn_event_id, game_date, raw_json, state_hash, valid_from, last_seen) "
+                "VALUES ('nhl', 0, 3, ?, 'ev', 301, 301, 301, 'David Pastrnak', 'rw', "
+                "'nhl_api', 8008, '2026-11-08', '{}', 'h', ?, ?)",
+                (group, at, at))
+        calls = []
+        result = refresh(self.conn, log=lambda *_: None, today=TODAY, now=NOW,
+                         fetch=self._fetch(calls=calls))
+        self.assertEqual(result["errors"], 0, result)
+        self.assertTrue(any("nhle.com" in url for url in calls))
+        open_groups = [row[0] for row in self.conn.execute(
+            "SELECT group_id FROM nhl_line_states WHERE espn_event_id = 8008 "
+            "AND nhl_player_id = 301 AND valid_to IS NULL ORDER BY group_id")]
+        self.assertEqual(open_groups, ["f1"])
+        again = []
+        second = refresh(self.conn, log=lambda *_: None, today=TODAY, now=NOW,
+                         fetch=self._fetch(calls=again))
+        self.assertEqual(second["errors"], 0, second)
+        self.assertEqual([url for url in again if "nhle.com" in url], [])
+
     def test_build_units_counts_five_on_five_only(self):
-        positions = {}
-        for pid, first, last, pos in _BOS + _FLA:
-            kind = "D" if pos == "D" else "F"
-            positions[pid] = {"kind": kind, "position_id": pos.lower() if pos != "RW" else "rw",
-                              "name": f"{first} {last}"}
-        positions[301]["position_id"] = "rw"
-        positions[302]["position_id"] = "c"
-        positions[901]["position_id"] = "c"
-        for pid, pos in ((303, "rw"), (904, "c"), (905, "lw"), (906, "d"), (907, "d"),
-                         (902, "d"), (903, "d")):
-            positions[pid]["position_id"] = pos
-        positions[311] = {"kind": "G", "position_id": "g", "name": "Jeremy Swayman"}
-        positions[312] = {"kind": "G", "position_id": "g", "name": "Sergei Bobrovsky"}
+        positions = _syn_positions()
         units = build_units(SYN_SHIFTS, positions, min_seconds=MIN_UNIT_SECONDS)
         bos = units["BOS"]
         self.assertEqual(len(bos["lines"]), 1)
@@ -377,6 +421,69 @@ class RefreshTest(unittest.TestCase):
             {902, 903})
         short = build_units(SYN_SHIFTS, positions, min_seconds=301)
         self.assertEqual(short.get("BOS", {}).get("lines", []), [])
+
+    def test_build_units_keeps_four_lines_and_three_pairs(self):
+        shifts, positions = [], {}
+        for pid in range(1, 16):
+            positions[pid] = {"kind": "F", "position_id": "c", "name": f"F{pid}"}
+        for pid in range(101, 109):
+            positions[pid] = {"kind": "D", "position_id": "d", "name": f"D{pid}"}
+        for pid, kind in ((201, "F"), (202, "F"), (203, "F"), (204, "D"), (205, "D")):
+            positions[pid] = {"kind": kind, "position_id": kind.lower(), "name": f"O{pid}"}
+        slices = [
+            (400, (1, 2, 3), (101, 102)),
+            (300, (1, 4, 5), (101, 103)),
+            (250, (4, 5, 6), (103, 104)),
+            (200, (7, 8, 9), (105, 106)),
+            (180, (10, 11, 12), (102, 105)),
+            (150, (13, 14, 15), (107, 108)),
+        ]
+        cursor = 0
+        for seconds, forwards, defense in slices:
+            end = cursor + seconds
+            for pid in forwards + defense:
+                shifts.append(_shift(pid, "P", str(pid), "SEA", _mmss(cursor), _mmss(end)))
+            for pid in (201, 202, 203, 204, 205):
+                shifts.append(_shift(pid, "O", str(pid), "OPP", _mmss(cursor), _mmss(end)))
+            cursor = end
+        units = build_units(shifts, positions, min_seconds=MIN_UNIT_SECONDS)
+        sea = units["SEA"]
+        self.assertEqual(
+            [{p["player_id"] for p in line["players"]} for line in sea["lines"]],
+            [{1, 2, 3}, {4, 5, 6}, {7, 8, 9}, {10, 11, 12}])
+        self.assertEqual([line["seconds"] for line in sea["lines"]], [400, 250, 200, 180])
+        self.assertEqual([line["group_id"] for line in sea["lines"]], ["f1", "f2", "f3", "f4"])
+        self.assertEqual(
+            [{p["player_id"] for p in pair["players"]} for pair in sea["pairs"]],
+            [{101, 102}, {103, 104}, {105, 106}])
+        self.assertEqual([pair["group_id"] for pair in sea["pairs"]], ["d1", "d2", "d3"])
+        forward_ids = [pid for line in sea["lines"] for pid in
+                       (p["player_id"] for p in line["players"])]
+        defense_ids = [pid for pair in sea["pairs"] for pid in
+                       (p["player_id"] for p in pair["players"])]
+        self.assertEqual(len(forward_ids), len(set(forward_ids)))
+        self.assertEqual(len(defense_ids), len(set(defense_ids)))
+
+    def test_build_units_counts_every_overtime_period(self):
+        positions = _syn_positions()
+        extra = []
+        for row in SYN_SHIFTS:
+            if row.get("typeCode") != 517 or row.get("endTime") != "05:00":
+                continue
+            if row["lastName"] in ("Swayman", "Bobrovsky"):
+                continue
+            overtime = dict(row)
+            overtime["period"] = 6
+            overtime["endTime"] = "02:00"
+            extra.append(overtime)
+            ignored = dict(row)
+            ignored["period"] = 0
+            extra.append(ignored)
+        units = build_units(SYN_SHIFTS + extra, positions, min_seconds=MIN_UNIT_SECONDS)
+        # Period 1 is five minutes at 5-on-5. Period 6 adds two minutes.
+        # Period 0 is another five minutes and must not count.
+        self.assertEqual(units["BOS"]["lines"][0]["seconds"], 420)
+        self.assertEqual(units["FLA"]["pairs"][0]["seconds"], 420)
 
     def test_nothing_calls_blocked_hosts(self):
         root = Path(__file__).resolve().parents[1] / "bayesratings"
@@ -466,6 +573,23 @@ class RecordedNhlTest(unittest.TestCase):
             "AND team_id = 1 AND espn_event_id = 88015 AND valid_to IS NULL) "
             "AND espn_event_id = 88015 AND valid_to IS NULL ORDER BY name")]
         self.assertEqual(names, ["Connor McDavid", "Leon Draisaitl", "Vasily Podkolzin"])
+        buckets = {}
+        for team, group, pid in conn.execute(
+                "SELECT team_id, group_id, nhl_player_id FROM nhl_line_states "
+                "WHERE espn_event_id = 88015 AND source = 'nhl_api' AND valid_to IS NULL"):
+            buckets.setdefault(team, {}).setdefault(group, set()).add(pid)
+        self.assertEqual(set(buckets), {1, 2})
+        for team, groups in buckets.items():
+            forward = [g for g in groups if str(g).startswith("f")]
+            defense = [g for g in groups if str(g).startswith("d")]
+            self.assertGreaterEqual(len(forward), 1, team)
+            self.assertLessEqual(len(forward), 4, team)
+            self.assertLessEqual(len(defense), 3, team)
+            for prefix in (forward, defense):
+                seen = set()
+                for group in prefix:
+                    self.assertFalse(seen & groups[group], (team, group))
+                    seen |= groups[group]
         pod = conn.execute(
             "SELECT athlete_id FROM nhl_line_states WHERE name = 'Vasily Podkolzin'").fetchone()
         self.assertIsNone(pod[0])
@@ -477,6 +601,83 @@ class RecordedNhlTest(unittest.TestCase):
 
         refresh(conn, log=lambda *_: None, today=today, now=now, fetch=fetch_again)
         self.assertEqual(calls, [])
+
+
+class EmptyChartTest(unittest.TestCase):
+    """Starters without lines stay open until a fetch past the wait."""
+
+    def _conn(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        conn = db.connect(Path(tmp.name) / "state.db")
+        self.addCleanup(conn.close)
+        db.init_db(conn)
+        conn.isolation_level = None
+        conn.execute(
+            "INSERT INTO teams (team_id, league, espn_id, abbreviation, name) "
+            "VALUES (3, 'nhl', 6, 'BOS', 'Boston Bruins'), "
+            "(4, 'nhl', 26, 'FLA', 'Florida Panthers')")
+        conn.execute(
+            "INSERT INTO games (espn_event_id, league, season, season_type, start_time_utc, "
+            "game_date, home_team_id, away_team_id, completed, neutral_site, covid_2020, "
+            "if_necessary, series_completed) VALUES (8008, 'nhl', 2027, 2, "
+            "'2026-11-08T00:00:00Z', '2026-11-08', 3, 4, 1, 0, 0, 0, 0)")
+        return conn
+
+    def test_empty_chart_retries_until_48h_after_start(self):
+        conn = self._conn()
+        calls = []
+
+        def fetch(url, accept, headers):
+            calls.append(url)
+            for host in BLOCKED:
+                if host in url:
+                    raise AssertionError(url)
+            if "/schedule/" in url:
+                return SCHEDULE_JSON
+            if "/boxscore" in url:
+                return BOX_JSON
+            if "shiftcharts" in url:
+                return _dump({"total": 0, "data": []})
+            raise Missing(url)
+
+        early = datetime(2026, 11, 8, 12, tzinfo=timezone.utc)
+        late = early + timedelta(hours=EMPTY_CHART_HOURS)
+        today = early.date()
+
+        def nhl_calls():
+            got = [url for url in calls if "nhle.com" in url]
+            calls.clear()
+            return got
+
+        first = refresh(conn, log=lambda *_: None, today=today, now=early, fetch=fetch)
+        self.assertEqual(first["errors"], 0, first)
+        self.assertGreaterEqual(len(nhl_calls()), 3)
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM nhl_goalie_states WHERE source = 'nhl_api' "
+            "AND valid_to IS NULL").fetchone()[0], 2)
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM nhl_line_states WHERE espn_event_id = 8008 "
+            "AND valid_to IS NULL").fetchone()[0], 0)
+
+        second = refresh(conn, log=lambda *_: None, today=today, now=early, fetch=fetch)
+        self.assertEqual(second["errors"], 0, second)
+        self.assertGreaterEqual(len(nhl_calls()), 3)
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM nhl_goalie_states WHERE source = 'nhl_api' "
+            "AND valid_to IS NULL").fetchone()[0], 2)
+
+        # The early fetches are still inside the wait, so the first night
+        # after it does one more read. That read is the confirmation.
+        third = refresh(conn, log=lambda *_: None, today=late.date(), now=late, fetch=fetch)
+        self.assertEqual(third["errors"], 0, third)
+        self.assertGreaterEqual(len(nhl_calls()), 3)
+        fourth = refresh(conn, log=lambda *_: None, today=late.date(), now=late, fetch=fetch)
+        self.assertEqual(fourth["errors"], 0, fourth)
+        self.assertEqual(nhl_calls(), [])
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM nhl_line_states WHERE espn_event_id = 8008 "
+            "AND valid_to IS NULL").fetchone()[0], 0)
 
 
 if __name__ == "__main__":
