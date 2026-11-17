@@ -305,6 +305,7 @@ BOX_SQL = (
     "THEN g.away_team_id ELSE g.home_team_id END "
     + _season_name("os", "o.team_id", "g.season") + " "
     "WHERE b.league = :league AND g.season = :season "
+    "AND COALESCE(g.status, '') != 'final_no_data' "
     "ORDER BY g.game_date, g.espn_event_id, b.team_id")
 
 
@@ -375,6 +376,8 @@ STATS_SQL = (
     "LEFT JOIN teams o ON o.team_id = s.opp_team_id "
     + _season_name("os", "s.opp_team_id", "s.season") + " "
     "WHERE s.league = :league AND s.season = :season "
+    "AND NOT EXISTS (SELECT 1 FROM games g WHERE g.espn_event_id = s.espn_event_id "
+    "AND g.status = 'final_no_data') "
     "ORDER BY s.game_date, s.espn_event_id, s.team_id")
 
 

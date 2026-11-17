@@ -169,6 +169,9 @@ def run(league, season, cache, force=False, summary_workers=backfill.SUMMARY_WOR
                   "season": season, "reason": "no_games", "games": 0}
         _result_line(result)
         return result
+    cleared = coverage.clear_scoreless_finals(conn, league, season)
+    if cleared:
+        log(f"{league} {season}: {cleared} final games had a 0-0 score and no box")
     conn.isolation_level = None
     players.extract(conn, [league], log=log)
     teambox.extract(conn, [league], log=log)

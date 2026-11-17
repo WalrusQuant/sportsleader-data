@@ -14,8 +14,8 @@ from zoneinfo import ZoneInfo
 
 import pyarrow.parquet as pq
 
-from bayesratings import backfill, coverage, db, espn, export, gh_publish, players
-from bayesratings import queue_seasons, season_backfill
+from bayesratings import backfill, coverage, db, espn, export, gh_publish, labstats, players
+from bayesratings import queue_seasons, season_backfill, teambox
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 ROOT = Path(__file__).resolve().parent.parent
@@ -433,6 +433,92 @@ class ResumeAndQueueTest(unittest.TestCase):
             blob += (ROOT / "bayesratings" / name).read_text()
         self.assertNotIn("SPORTSLEADER_DISPATCH_TOKEN", blob)
         self.assertNotIn("CRONJOB_ORG_API_KEY", blob)
+
+
+class ScorelessFinalTest(unittest.TestCase):
+    def test_empty_final_is_not_a_zero_score(self):
+        empty = _load("nfl", "191101009_summary.json")
+        self.assertFalse(coverage.box_has_data(empty))
+        with_line = json.loads(json.dumps(empty))
+        with_line["boxscore"]["players"][0]["statistics"][0]["athletes"] = [
+            {"athlete": {"id": "1", "displayName": "Brett Favre"}, "stats": ["1/2", "7"]}
+        ]
+        self.assertTrue(coverage.box_has_data(with_line))
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = db.connect(Path(tmp) / "t.db")
+            db.init_db(conn)
+            conn.execute(
+                "INSERT INTO teams (team_id, league, espn_id, abbreviation, name, in_directory) "
+                "VALUES (9, 'nfl', 9, 'GB', 'Green Bay Packers', 1), "
+                "(26, 'nfl', 26, 'SEA', 'Seattle Seahawks', 1)")
+            conn.executemany(
+                "INSERT INTO games (espn_event_id, league, season, season_type, "
+                "start_time_utc, game_date, home_team_id, away_team_id, home_score, "
+                "away_score, completed, status) VALUES "
+                "(?, 'nfl', ?, 2, '1999-11-01T18:00:00+00:00', ?, 9, 26, ?, ?, 1, 'STATUS_FINAL')",
+                [
+                    (191101009, 1999, "1999-11-01", 0, 0),
+                    (191101010, 1999, "1999-11-02", 0, 0),
+                    (191101011, 1999, "1999-11-03", 27, 0),
+                    (401000001, 2024, "2024-11-01", 0, 0),
+                ])
+            backfill.store_summary(conn, "nfl", 191101009, empty)
+            backfill.store_summary(conn, "nfl", 191101010, with_line)
+            backfill.store_summary(conn, "nfl", 401000001, empty)
+            conn.commit()
+            labstats.extract(conn, ["nfl"], log=lambda *_: None)
+            teambox.extract(conn, ["nfl"], log=lambda *_: None)
+            self.assertEqual(coverage.clear_scoreless_finals(conn, "nfl", 1999), 1)
+            self.assertEqual(coverage.clear_scoreless_finals(conn, "nfl", 2024), 0)
+            cleared = conn.execute(
+                "SELECT completed, home_score, away_score, status FROM games "
+                "WHERE espn_event_id = 191101009").fetchone()
+            self.assertEqual(cleared["completed"], 1)
+            self.assertIsNone(cleared["home_score"])
+            self.assertIsNone(cleared["away_score"])
+            self.assertEqual(cleared["status"], "final_no_data")
+            kept = conn.execute(
+                "SELECT home_score, away_score, status FROM games WHERE espn_event_id = 191101010"
+            ).fetchone()
+            self.assertEqual(tuple(kept), (0, 0, "STATUS_FINAL"))
+            shutout = conn.execute(
+                "SELECT home_score, away_score, status FROM games WHERE espn_event_id = 191101011"
+            ).fetchone()
+            self.assertEqual(tuple(shutout), (27, 0, "STATUS_FINAL"))
+            current = conn.execute(
+                "SELECT home_score, away_score, status FROM games WHERE espn_event_id = 401000001"
+            ).fetchone()
+            self.assertEqual(tuple(current), (0, 0, "STATUS_FINAL"))
+            labstats.extract(conn, ["nfl"], log=lambda *_: None)
+            teambox.extract(conn, ["nfl"], log=lambda *_: None)
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM team_game_stats WHERE espn_event_id = 191101009"
+            ).fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM team_game_box WHERE espn_event_id = 191101009"
+            ).fetchone()[0], 0)
+            self.assertGreater(conn.execute(
+                "SELECT COUNT(*) FROM team_game_stats WHERE espn_event_id = 191101010"
+            ).fetchone()[0], 0)
+            report = coverage.build_report(conn, "nfl", 1999, {})
+            self.assertEqual(report["games_missing_score"], 1)
+            self.assertEqual(report["games"], 3)
+            conn.close()
+            out = Path(tmp) / "out"
+            export.run(str(Path(tmp) / "t.db"), out, leagues=("nfl",),
+                       datasets={"games"}, log=lambda *_: None)
+            table = pq.read_table(out / "nfl" / "games" / "1999.parquet")
+            spec = next(ds for ds in export.DATASETS if ds.name == "games")
+            self.assertEqual(table.column_names, [name for name, _ in spec.columns("nfl")])
+            by_id = {table.column("game_id")[i].as_py(): i for i in range(table.num_rows)}
+            row = by_id[191101009]
+            self.assertEqual(table.column("status")[row].as_py(), "final_no_data")
+            self.assertTrue(table.column("completed")[row].as_py())
+            self.assertIsNone(table.column("home_score")[row].as_py())
+            self.assertIsNone(table.column("away_score")[row].as_py())
+            real = by_id[191101011]
+            self.assertEqual(table.column("home_score")[real].as_py(), 27)
+            self.assertEqual(table.column("away_score")[real].as_py(), 0)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,11 @@
 """Blank stats ESPN filled with zero before it tracked them, and describe one season.
 
+A final pro game that ESPN reports as 0-0 with no team or player box is not a
+real result (event 191101009 is Seattle 27, Green Bay 7, stored as 0-0). On a
+historical season the scores are cleared and the status becomes
+``final_no_data``. The games columns do not change. Current seasons are left
+as ESPN sent them.
+
 A column is untracked for a season when every value is missing or zero
 (plus/minus included: a real season has negatives). The column is then
 written as null. A zero next to any other value is a real zero and stays.
@@ -25,6 +31,78 @@ HISTORY_BEFORE = {
 _KEEP = {
     "season", "game_id", "home_score", "away_score", "score", "opponent_score",
 }
+
+
+def box_has_data(summary) -> bool:
+    """True when a summary has a player line or a team statistic.
+
+    Old finals sometimes return the category shells (passing, rushing) with
+    no athletes, and a team object whose statistics list is empty. That is
+    not a box."""
+    if not isinstance(summary, dict):
+        return False
+    box = summary.get("boxscore") or {}
+    for side in box.get("players") or []:
+        for group in side.get("statistics") or []:
+            for athlete in group.get("athletes") or []:
+                if (athlete.get("athlete") or {}).get("id") not in (None, ""):
+                    return True
+    for side in box.get("teams") or []:
+        for stat in side.get("statistics") or []:
+            if stat.get("stats"):
+                return True
+            if stat.get("name") and (
+                    stat.get("displayValue") not in (None, "")
+                    or stat.get("value") not in (None, "")):
+                return True
+    return False
+
+
+def clear_scoreless_finals(conn, league, season) -> int:
+    """Null the score of a historical final that has no box, and drop derived rows.
+
+    A 0-0 final is not a possible result in MLB, NBA, NFL, or NHL. ESPN still
+    marks some old games STATUS_FINAL with both scores 0 and an empty box.
+    ``completed`` stays 1. ``status`` becomes ``final_no_data``. Team box and
+    team counting rows for that game are removed so they are not published.
+    A current season is not touched, and a 0-0 that actually has a box is kept."""
+    from . import db
+    if not blanks_history(league, season):
+        return 0
+    hidden = db.HIDDEN_STATUSES
+    rows = conn.execute(
+        "SELECT g.espn_event_id, s.json_gz FROM games g "
+        "LEFT JOIN game_summaries s ON s.espn_event_id = g.espn_event_id "
+        "WHERE g.league = ? AND g.season = ? AND g.completed = 1 "
+        "AND g.season_type IN (2, 3) AND g.home_score = 0 AND g.away_score = 0 "
+        "AND COALESCE(g.status, '') NOT IN ({})".format(
+            ",".join("?" * len(hidden))),
+        (league, int(season), *hidden)).fetchall()
+    import gzip
+    import json
+    clear = []
+    for eid, blob in rows:
+        summary = None
+        if blob:
+            try:
+                summary = json.loads(gzip.decompress(blob))
+            except (OSError, ValueError):
+                summary = None
+        if summary is not None and box_has_data(summary):
+            continue
+        clear.append(int(eid))
+    if not clear:
+        return 0
+    marks = ",".join("?" * len(clear))
+    conn.execute(
+        f"UPDATE games SET home_score = NULL, away_score = NULL, status = ? "
+        f"WHERE espn_event_id IN ({marks})",
+        (db.FINAL_NO_DATA, *clear))
+    for table in ("team_game_stats", "team_game_box"):
+        conn.execute(
+            f"DELETE FROM {table} WHERE espn_event_id IN ({marks})", clear)
+    conn.commit()
+    return len(clear)
 
 
 def blanks_history(league, season) -> bool:
@@ -109,6 +187,8 @@ def build_report(conn, league, season, blanked) -> dict:
         "season": int(season),
         "games": games,
         "games_with_player_box": with_box,
+        "games_missing_score": sum(
+            1 for r in playable if (r["status"] or "") == db.FINAL_NO_DATA),
         "player_box_coverage": coverage,
         "flagged_below_95": bool(games) and (coverage or 0) < 0.95,
         "blanked_stats": {k: list(v) for k, v in sorted((blanked or {}).items())},

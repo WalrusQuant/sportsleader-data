@@ -121,6 +121,10 @@ def _central_game_dates(conn: sqlite3.Connection) -> int:
 # on a slate. STATUS_REMOVED is ours: ESPN stopped listing the event (an "if
 # necessary" playoff game after a clinch, or a dropped fixture). Rows are kept.
 REMOVED = "STATUS_REMOVED"
+# A finished pro game whose scoreboard says 0-0 and whose summary has no team
+# or player box. The games file keeps the row (completed, scores empty) and
+# publishes this status. It is not a hidden status: the game was played.
+FINAL_NO_DATA = "final_no_data"
 HIDDEN_STATUSES = ("STATUS_POSTPONED", "STATUS_CANCELED", "STATUS_CANCELLED",
                    "STATUS_SUSPENDED", "STATUS_FORFEIT", REMOVED)
 HIDDEN_SQL = ", ".join(f"'{s}'" for s in HIDDEN_STATUSES)   # constants, safe to inline

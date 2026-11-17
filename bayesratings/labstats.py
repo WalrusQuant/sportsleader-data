@@ -518,6 +518,7 @@ def _pending(conn, league):
         "FROM games g JOIN game_summaries s USING (espn_event_id) "
         f"WHERE g.league = ? AND g.completed = 1 AND g.season_type IN (2, 3) "
         f"AND g.home_score IS NOT NULL AND g.away_score IS NOT NULL "
+        f"AND COALESCE(g.status, '') != '{db.FINAL_NO_DATA}' "
         f"AND {db.playable_sql('g')} AND {ex} AND NOT EXISTS ("
         "SELECT 1 FROM team_game_stats y WHERE y.espn_event_id = g.espn_event_id "
         "AND y.version = ? AND y.summary_fetched_at = s.fetched_at "
