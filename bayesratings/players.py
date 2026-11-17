@@ -95,7 +95,12 @@ def flatten(keys, stats):
     compound keys ('hits-atBats' '1-4', 'completions/passingAttempts'
     '22/32') into their parts. Raises BoxError if the lengths differ (a
     format we don't understand)."""
-    if len(keys) != len(stats):
+    # Old passing lines list QBRating in the keys and omit the value. Pad the
+    # tail so the named stats that are present stay aligned; a longer line is
+    # still a format we don't understand.
+    if len(stats) < len(keys):
+        stats = list(stats) + [""] * (len(keys) - len(stats))
+    elif len(stats) > len(keys):
         raise BoxError(f"{len(keys)} keys vs {len(stats)} stats")
     raw = {k: "" if v is None else str(v) for k, v in zip(keys, stats)}
     flat = dict(raw)

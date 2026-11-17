@@ -40,6 +40,11 @@ def manifest_url() -> str:
     return f"https://github.com/{OWNER}/{REPO}/releases/download/manifest/manifest.json"
 
 
+def coverage_url(league, season) -> str:
+    return (f"https://github.com/{OWNER}/{REPO}/releases/download/"
+            f"coverage/{league}_{season}.json")
+
+
 def _token():
     token = os.environ.get(TOKEN_ENV, "").strip()
     if not token:
@@ -134,7 +139,13 @@ def manifest_fingerprint(manifest) -> str:
     files = []
     for entry in (manifest or {}).get("files") or []:
         files.append((entry.get("path"), entry.get("sha256"), entry.get("rows")))
-    blob = json.dumps(sorted(files), separators=(",", ":"))
+    coverage = []
+    raw = (manifest or {}).get("coverage") or {}
+    if isinstance(raw, dict):
+        for key in sorted(raw):
+            item = raw[key] or {}
+            coverage.append((key, item.get("sha256")))
+    blob = json.dumps({"files": sorted(files), "coverage": coverage}, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
@@ -145,7 +156,7 @@ def _file_item(entry) -> dict:
     return item
 
 
-def merge_manifest(remote, changed, catalog) -> dict:
+def merge_manifest(remote, changed, catalog, coverage=None) -> dict:
     """Copy of `remote` with this run's files replaced or added. Every other
     file is kept. `changed` is a list of file entries or a path -> entry map.
     `catalog` is a function (files) -> datasets block, or that block itself."""
@@ -167,6 +178,11 @@ def merge_manifest(remote, changed, catalog) -> dict:
     out = dict(remote)
     out["files"] = files
     out["datasets"] = catalog(files) if callable(catalog) else catalog
+    if coverage:
+        have = dict(out.get("coverage") or {})
+        for key, item in coverage.items():
+            have[key] = item
+        out["coverage"] = have
     out["generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     out["manifest_url"] = manifest_url()
     return out
@@ -182,7 +198,8 @@ def upload_manifest(manifest) -> None:
                   f"sha256:{hashlib.sha256(body).hexdigest()}")
 
 
-def commit_manifest(changed, catalog, fetch, upload, attempts=6, sleep=time.sleep):
+def commit_manifest(changed, catalog, fetch, upload, attempts=6, sleep=time.sleep,
+                    coverage=None):
     """Re-read the manifest immediately before writing it, and merge only this
     run's files. If another writer lands in that window, try again. Both
     writers doing this is what keeps a backfill upload that finishes during
@@ -201,7 +218,7 @@ def commit_manifest(changed, catalog, fetch, upload, attempts=6, sleep=time.slee
         if manifest_fingerprint(latest) != token:
             sleep(0.2 * (attempt + 1))
             continue
-        merged = merge_manifest(latest, incoming, catalog)
+        merged = merge_manifest(latest, incoming, catalog, coverage=coverage)
         upload(merged)
         confirmed = fetch()
         if manifest_fingerprint(confirmed) != manifest_fingerprint(merged):
