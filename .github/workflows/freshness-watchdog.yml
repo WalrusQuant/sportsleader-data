@@ -1,0 +1,108 @@
+name: Freshness watchdog
+
+# Dispatched around 5:30 AM America/Chicago, after Nightly data update.
+# An external scheduler starts this with workflow_dispatch. The job reads
+# the manifest nightly.py publishes (gh_publish.upload_manifest on the
+# manifest release) and exits non-zero when generated_at is not today's
+# America/Chicago date, or when that file cannot be read.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-freshness:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check published manifest date
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.request
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          CHICAGO = ZoneInfo("America/Chicago")
+          MANIFEST_URL = (
+              "https://github.com/WalrusQuant/sportsleader-data/releases/download/"
+              "manifest/manifest.json"
+          )
+
+
+          def emit(message, ok):
+              print(message, flush=True)
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  heading = "Manifest is from today" if ok else "Manifest check failed"
+                  with open(summary, "a", encoding="utf-8") as fh:
+                      fh.write(f"### {heading}\n\n{message}\n")
+
+
+          def parse_generated_at(value):
+              if not isinstance(value, str) or not value.strip():
+                  raise ValueError("manifest has no generated_at")
+              text = value.strip()
+              if text.endswith(("Z", "z")):
+                  text = text[:-1] + "+00:00"
+              stamp = datetime.fromisoformat(text)
+              if stamp.tzinfo is None:
+                  stamp = stamp.replace(tzinfo=ZoneInfo("UTC"))
+              return stamp.astimezone(CHICAGO)
+
+
+          def fetch_manifest():
+              req = urllib.request.Request(
+                  MANIFEST_URL,
+                  headers={"User-Agent": "sportsleader-data-freshness-watchdog"},
+              )
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  manifest = json.load(resp)
+              if not isinstance(manifest, dict):
+                  raise ValueError("manifest JSON is not an object")
+              return manifest
+
+
+          def main():
+              now = datetime.now(CHICAGO)
+              try:
+                  manifest = fetch_manifest()
+              except Exception as exc:
+                  emit(
+                      "FAIL: could not read published manifest "
+                      f"({MANIFEST_URL}): {type(exc).__name__}: {exc}",
+                      ok=False,
+                  )
+                  return 1
+              try:
+                  published = parse_generated_at(manifest.get("generated_at"))
+              except Exception as exc:
+                  emit(
+                      "FAIL: could not read published manifest generated_at "
+                      f"({MANIFEST_URL}): {type(exc).__name__}: {exc}",
+                      ok=False,
+                  )
+                  return 1
+              generated = manifest.get("generated_at")
+              if published.date() != now.date():
+                  emit(
+                      "FAIL: published manifest is stale. "
+                      f"generated_at={generated} is {published:%Y-%m-%d %H:%M %Z}, "
+                      f"not {now:%Y-%m-%d} America/Chicago (now {now:%H:%M}).",
+                      ok=False,
+                  )
+                  return 1
+              emit(
+                  "OK: published manifest generated_at="
+                  f"{generated} is {published:%Y-%m-%d %H:%M %Z}, "
+                  f"today in America/Chicago (now {now:%H:%M}).",
+                  ok=True,
+              )
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
